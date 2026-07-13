@@ -216,6 +216,10 @@ where C: RaftTypeConfig
     /// Start to elect this node as leader
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn elect(&mut self) {
+        // A campaign consumes the timeout selected for it. Select a new timeout
+        // for the next campaign so repeated split votes do not remain in lockstep.
+        self.config.resample_election_timeout::<C::AsyncRuntime>();
+
         let new_term = self.state.vote.leader_id().term + 1;
         let new_vote = Vote::new(new_term, self.config.id.clone());
 
