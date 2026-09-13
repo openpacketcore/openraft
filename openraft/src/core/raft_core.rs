@@ -1617,6 +1617,10 @@ where
                 self.leader_data = Some(LeaderData::new());
             }
             Command::QuitLeader => {
+                // A following node may truncate the former leader's suffix.
+                // Join its readers before any later storage command removes
+                // that range; partial append retries still own log reads.
+                self.remove_all_replication().await;
                 self.leader_data = None;
             }
             Command::AppendInputEntries { vote, entries } => {
