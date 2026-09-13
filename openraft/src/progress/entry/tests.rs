@@ -36,6 +36,35 @@ fn test_is_log_range_inflight() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_snapshot_inflight_retains_catchup_suffix_until_completion() -> anyhow::Result<()> {
+    let mut pe = ProgressEntry::empty(20);
+    pe.inflight = Inflight::snapshot(Some(log_id(5)));
+    assert!(!pe.is_log_range_inflight(&log_id(4)));
+    assert!(!pe.is_log_range_inflight(&log_id(5)));
+    assert!(
+        pe.is_log_range_inflight(&log_id(6)),
+        "snapshot receiver still needs its suffix"
+    );
+    assert!(pe.is_log_range_inflight(&log_id(10)));
+    pe.update_matching(pe.inflight.id(), Some(log_id(5)))?;
+    assert!(
+        !pe.is_log_range_inflight(&log_id(6)),
+        "completed transfer releases its inflight claim"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_empty_snapshot_inflight_retains_the_first_log() {
+    let mut pe = ProgressEntry::empty(20);
+    pe.inflight = Inflight::snapshot(None);
+    assert!(pe.is_log_range_inflight(&log_id(0)));
+    assert!(pe.is_log_range_inflight(&log_id(1)));
+    pe.inflight = Inflight::None;
+    assert!(!pe.is_log_range_inflight(&log_id(1)));
+}
+
+#[test]
 fn test_update_matching() -> anyhow::Result<()> {
     // Update matching and inflight
     {
@@ -91,10 +120,8 @@ impl LogState {
         Self {
             last: Some(log_id(last)),
             snap_last: Some(log_id(snap_last)),
-            // `next_send()` only checks purge_upto, but not purged,
-            // We just fake a purged
             purge_upto: Some(log_id(purge_upto)),
-            purged: Some(log_id(purge_upto - 1)),
+            purged: Some(log_id(purge_upto)),
         }
     }
 }

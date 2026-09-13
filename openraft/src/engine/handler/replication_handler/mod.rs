@@ -279,6 +279,9 @@ where C: RaftTypeConfig
             func_name!()
         );
 
+        let matched_data =
+            request_id != RequestId::HeartBeat && matches!(&repl_res, Ok(response) if response.result.is_ok());
+
         match repl_res {
             Ok(p) => {
                 self.update_success_progress(target.clone(), request_id, p);
@@ -308,9 +311,12 @@ where C: RaftTypeConfig
             }
         };
 
-        // The purge job may be postponed because a replication task is using them.
-        // Thus we just try again to purge when progress is updated.
-        self.try_purge_log();
+        // A failed or conflicting transfer releases its retention before a
+        // retry. Successful data replication must first hand off the next log
+        // range, including the suffix following an installed snapshot.
+        if !matched_data {
+            self.try_purge_log();
+        }
 
         // initialize next replication to this target
 
@@ -325,6 +331,10 @@ where C: RaftTypeConfig
             } else {
                 tracing::debug!("nothing to send to target={target}, progress:{}", p);
             }
+        }
+
+        if matched_data {
+            self.try_purge_log();
         }
     }
 
