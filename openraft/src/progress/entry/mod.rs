@@ -74,7 +74,8 @@ impl<NID: NodeId> ProgressEntry<NID> {
 
     /// Return if a range of log id `..=log_id` is inflight sending.
     ///
-    /// `prev_log_id` is never inflight.
+    /// `prev_log_id` is never inflight. A snapshot owns the log suffix after its
+    /// last log id until the transfer completes, so the receiver can catch up.
     pub(crate) fn is_log_range_inflight(&self, upto: &LogId<NID>) -> bool {
         match &self.inflight {
             Inflight::None => false,
@@ -82,7 +83,7 @@ impl<NID: NodeId> ProgressEntry<NID> {
                 let lid = Some(upto.clone());
                 lid > log_id_range.prev
             }
-            Inflight::Snapshot { last_log_id: _, .. } => false,
+            Inflight::Snapshot { last_log_id, .. } => Some(upto) > last_log_id.as_ref(),
         }
     }
 
@@ -184,6 +185,28 @@ impl<NID: NodeId> ProgressEntry<NID> {
         log_state: &impl LogStateReader<NID>,
         max_entries: u64,
     ) -> Result<&Inflight<NID>, &Inflight<NID>> {
+        self.next_send_after_purge(log_state, max_entries, log_state.purge_upto().next_index())
+    }
+
+    /// Hand a successful data acknowledgement directly to the retained log suffix.
+    ///
+    /// Only this handoff may reuse logs held below a scheduled purge. New or
+    /// failed transfers use `next_send` so unreachable targets cannot repeatedly
+    /// acquire each other's pending purge ranges.
+    pub(crate) fn next_send_following_ack(
+        &mut self,
+        log_state: &impl LogStateReader<NID>,
+        max_entries: u64,
+    ) -> Result<&Inflight<NID>, &Inflight<NID>> {
+        self.next_send_after_purge(log_state, max_entries, log_state.last_purged_log_id().next_index())
+    }
+
+    fn next_send_after_purge(
+        &mut self,
+        log_state: &impl LogStateReader<NID>,
+        max_entries: u64,
+        purged_next: u64,
+    ) -> Result<&Inflight<NID>, &Inflight<NID>> {
         if !self.inflight.is_none() {
             return Err(&self.inflight);
         }
@@ -196,16 +219,11 @@ impl<NID: NodeId> ProgressEntry<NID> {
             last_next
         );
 
-        let purge_upto_next = {
-            let purge_upto = log_state.purge_upto();
-            purge_upto.next_index()
-        };
-
         // `searching_end` is the max value for `start`.
 
         // The log the follower needs is purged.
         // Replicate by snapshot.
-        if self.searching_end < purge_upto_next {
+        if self.searching_end < purged_next {
             self.curr_inflight_id += 1;
             let snapshot_last = log_state.snapshot_last_log_id();
             self.inflight = Inflight::snapshot(snapshot_last.cloned()).with_id(self.curr_inflight_id);
@@ -215,8 +233,8 @@ impl<NID: NodeId> ProgressEntry<NID> {
         // Replicate by logs.
         // Run a binary search to find the matching log id, if matching log id is not determined.
         let mut start = Self::calc_mid(self.matching.next_index(), self.searching_end);
-        if start < purge_upto_next {
-            start = purge_upto_next;
+        if start < purged_next {
+            start = purged_next;
         }
 
         let end = std::cmp::min(start + max_entries, last_next);
