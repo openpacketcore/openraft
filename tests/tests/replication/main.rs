@@ -6,6 +6,7 @@
 mod fixtures;
 
 mod t10_append_entries_partial_success;
+mod t20_stop_replication_on_stepdown;
 mod t50_append_entries_backoff;
 mod t50_append_entries_backoff_rejoin;
 mod t51_append_entries_too_large;

@@ -36,6 +36,35 @@ fn test_is_log_range_inflight() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_snapshot_inflight_retains_catchup_suffix_until_completion() -> anyhow::Result<()> {
+    let mut pe = ProgressEntry::empty(20);
+    pe.inflight = Inflight::snapshot(Some(log_id(5)));
+    assert!(!pe.is_log_range_inflight(&log_id(4)));
+    assert!(!pe.is_log_range_inflight(&log_id(5)));
+    assert!(
+        pe.is_log_range_inflight(&log_id(6)),
+        "snapshot receiver still needs its suffix"
+    );
+    assert!(pe.is_log_range_inflight(&log_id(10)));
+    pe.update_matching(pe.inflight.id(), Some(log_id(5)))?;
+    assert!(
+        !pe.is_log_range_inflight(&log_id(6)),
+        "completed transfer releases its inflight claim"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_empty_snapshot_inflight_retains_the_first_log() {
+    let mut pe = ProgressEntry::empty(20);
+    pe.inflight = Inflight::snapshot(None);
+    assert!(pe.is_log_range_inflight(&log_id(0)));
+    assert!(pe.is_log_range_inflight(&log_id(1)));
+    pe.inflight = Inflight::None;
+    assert!(!pe.is_log_range_inflight(&log_id(1)));
+}
+
+#[test]
 fn test_update_matching() -> anyhow::Result<()> {
     // Update matching and inflight
     {
@@ -91,10 +120,8 @@ impl LogState {
         Self {
             last: Some(log_id(last)),
             snap_last: Some(log_id(snap_last)),
-            // `next_send()` only checks purge_upto, but not purged,
-            // We just fake a purged
             purge_upto: Some(log_id(purge_upto)),
-            purged: Some(log_id(purge_upto - 1)),
+            purged: Some(log_id(purge_upto)),
         }
     }
 }
@@ -319,4 +346,23 @@ fn test_next_send() -> anyhow::Result<()> {
         assert_eq!(Ok(&inflight_logs(7, 12).with_id(1)), res);
     }
     Ok(())
+}
+
+#[test]
+fn test_only_successful_handoff_reuses_logs_held_below_pending_purge() {
+    let mut state = LogState::new(10, 12, 15);
+    state.purged = Some(log_id(2));
+    let mut retry = ProgressEntry::new(Some(log_id(5)));
+    let mut handoff = retry;
+
+    assert_eq!(
+        Ok(&Inflight::snapshot(Some(log_id(12))).with_id(1)),
+        retry.next_send(&state, 3),
+        "a new or failed attempt cannot pin the range again while another transfer holds purge",
+    );
+    assert_eq!(
+        Ok(&inflight_logs(5, 8).with_id(1)),
+        handoff.next_send_following_ack(&state, 3),
+        "successful data acknowledgement hands off the actual retained suffix",
+    );
 }
