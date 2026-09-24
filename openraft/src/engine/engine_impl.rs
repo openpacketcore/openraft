@@ -309,7 +309,7 @@ where C: RaftTypeConfig
             // Current leader lease has not yet expired, reject voting request
             if now <= vote_utime + lease {
                 tracing::info!(
-                    "reject vote-request: leader lease has not yet expire; now; {:?}, vote is updatd at: {:?}, leader lease({:?}) will expire after {:?}",
+                    "reject vote-request: leader lease has not yet expired; now; {:?}, vote is updated at: {:?}, leader lease({:?}) will expire after {:?}",
                     now,
                     vote_utime,
                     lease,
