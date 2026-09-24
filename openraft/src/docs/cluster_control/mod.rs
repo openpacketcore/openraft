@@ -11,3 +11,7 @@ pub mod dynamic_membership {
 pub mod node_lifecycle {
     #![doc = include_str!("node-lifecycle.md")]
 }
+
+pub mod planned_shutdown {
+    #![doc = include_str!("planned-shutdown.md")]
+}

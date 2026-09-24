@@ -8,6 +8,8 @@ use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::BoxCoreFn;
 use crate::raft::SnapshotResponse;
+use crate::raft::TransferLeaderError;
+use crate::raft::TransferLeaderRequest;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::type_config::alias::LogIdOf;
@@ -93,6 +95,21 @@ where C: RaftTypeConfig
         tx: ResponderOf<C>,
     },
 
+    BeginLeadershipTransfer {
+        to: C::NodeId,
+        tx: ResultSender<C, TransferLeaderRequest<C::NodeId>, TransferLeaderError>,
+    },
+
+    PrepareShutdown {
+        to: Option<C::NodeId>,
+        tx: ResultSender<C, Option<TransferLeaderRequest<C::NodeId>>, TransferLeaderError>,
+    },
+
+    HandleLeadershipTransfer {
+        request: TransferLeaderRequest<C::NodeId>,
+        tx: ResultSender<C, (), TransferLeaderError>,
+    },
+
     ExternalCoreRequest {
         req: BoxCoreFn<C>,
     },
@@ -129,6 +146,9 @@ where C: RaftTypeConfig
             } => {
                 format!("ChangeMembership: members: {:?}, retain: {}", members, retain,)
             }
+            RaftMsg::BeginLeadershipTransfer { .. } => "BeginLeadershipTransfer".to_string(),
+            RaftMsg::PrepareShutdown { .. } => "PrepareShutdown".to_string(),
+            RaftMsg::HandleLeadershipTransfer { .. } => "HandleLeadershipTransfer".to_string(),
             RaftMsg::ExternalCoreRequest { .. } => "External Request".to_string(),
             RaftMsg::ExternalCommand { cmd } => {
                 format!("ExternalCommand: {:?}", cmd)

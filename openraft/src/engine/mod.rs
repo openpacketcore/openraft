@@ -32,6 +32,7 @@ mod command_kind;
 mod engine_config;
 mod engine_impl;
 mod engine_output;
+mod leadership_transfer;
 mod log_id_list;
 
 pub(crate) mod handler;
@@ -45,6 +46,7 @@ mod tests {
     mod handle_vote_resp_test;
     mod initialize_test;
     mod install_full_snapshot_test;
+    mod leadership_transfer_test;
     mod log_id_list_test;
     mod startup_test;
     mod trigger_purge_log_test;

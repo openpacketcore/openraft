@@ -10,6 +10,7 @@ use crate::Instant;
 pub(crate) struct UTime<T, I: Instant> {
     data: T,
     utime: Option<I>,
+    lease_disabled: bool,
 }
 
 impl<T: fmt::Display, I: Instant> fmt::Display for UTime<T, I> {
@@ -26,6 +27,7 @@ impl<T: Clone, I: Instant> Clone for UTime<T, I> {
         Self {
             data: self.data.clone(),
             utime: self.utime,
+            lease_disabled: self.lease_disabled,
         }
     }
 }
@@ -35,13 +37,14 @@ impl<T: Default, I: Instant> Default for UTime<T, I> {
         Self {
             data: T::default(),
             utime: None,
+            lease_disabled: false,
         }
     }
 }
 
 impl<T: PartialEq, I: Instant> PartialEq for UTime<T, I> {
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data && self.utime == other.utime
+        self.data == other.data && self.utime == other.utime && self.lease_disabled == other.lease_disabled
     }
 }
 
@@ -64,13 +67,21 @@ impl<T, I: Instant> DerefMut for UTime<T, I> {
 impl<T, I: Instant> UTime<T, I> {
     /// Creates a new object that keeps track of the time when it was last updated.
     pub(crate) fn new(now: I, data: T) -> Self {
-        Self { data, utime: Some(now) }
+        Self {
+            data,
+            utime: Some(now),
+            lease_disabled: false,
+        }
     }
 
     /// Creates a new object that has no last-updated time.
     #[allow(dead_code)]
     pub(crate) fn without_utime(data: T) -> Self {
-        Self { data, utime: None }
+        Self {
+            data,
+            utime: None,
+            lease_disabled: false,
+        }
     }
 
     /// Return the last updated time of this object.
@@ -88,6 +99,17 @@ impl<T, I: Instant> UTime<T, I> {
     pub(crate) fn update(&mut self, now: I, data: T) {
         self.data = data;
         self.utime = Some(now);
+        self.lease_disabled = false;
+    }
+
+    /// Release this value's lease without advancing its ordinary election timer.
+    pub(crate) fn disable_lease(&mut self) {
+        self.lease_disabled = true;
+    }
+
+    /// Whether a planned handoff released the current value's lease.
+    pub(crate) fn lease_disabled(&self) -> bool {
+        self.lease_disabled
     }
 
     /// Update the last updated time.

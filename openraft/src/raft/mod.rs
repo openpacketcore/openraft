@@ -39,6 +39,8 @@ pub use message::ClientWriteResult;
 pub use message::InstallSnapshotRequest;
 pub use message::InstallSnapshotResponse;
 pub use message::SnapshotResponse;
+pub use message::TransferLeaderError;
+pub use message::TransferLeaderRequest;
 pub use message::VoteRequest;
 pub use message::VoteResponse;
 use tokio::sync::mpsc;
@@ -418,6 +420,74 @@ where C: RaftTypeConfig
 
         let (tx, rx) = C::AsyncRuntime::oneshot();
         self.inner.call_core(RaftMsg::RequestVote { rpc, tx }, rx).await
+    }
+
+    /// Stop admitting leader operations and issue an exact planned handoff.
+    ///
+    /// The application delivers the returned request through its authenticated
+    /// consensus transport to the current voters, including the intended
+    /// successor. Keep this node's replication listener and storage alive until
+    /// fresh successor leadership is observed. The handoff does not change
+    /// membership and is supported only for a committed stable configuration.
+    ///
+    /// Repeating this call for the same target in the same vote is idempotent.
+    /// Cancellation after dispatch may already have stopped admission. Once
+    /// initiated, admission cannot be resumed in the retiring vote; normal
+    /// elections and new votes remain authoritative. Callers that cache a
+    /// leader read lease must invalidate that cache before initiating a handoff.
+    /// Receipt of the request is not proof of a completed election.
+    pub async fn begin_leadership_transfer(
+        &self,
+        to: C::NodeId,
+    ) -> Result<TransferLeaderRequest<C::NodeId>, RaftError<C::NodeId, TransferLeaderError>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::BeginLeadershipTransfer { to, tx }, rx).await
+    }
+
+    /// Atomically stop campaigning and prepare this voter for planned shutdown.
+    ///
+    /// A current leader requires an eligible successor in `to` and returns an
+    /// engine-issued handoff request. A follower or candidate returns `None` and
+    /// cancels any pending campaign. Delayed vote responses and future election
+    /// triggers cannot make a successfully prepared node leader. A prepared node
+    /// also refuses to become the target of another leader's handoff. Replication,
+    /// snapshot installation and votes for other candidates remain available.
+    ///
+    /// Retirement cannot be reversed without creating a new Raft instance.
+    /// Repeated calls retain the original result, even after a vote change;
+    /// selecting a different target for an existing handoff is refused. This
+    /// operation does not stop the engine or certify successor leadership.
+    /// Authenticate and deliver a returned request, observe the successor's
+    /// fresh quorum proof, then use [`Self::shutdown`] to join the engine.
+    ///
+    /// Disable any application-cached read lease before calling. Cancellation
+    /// after dispatch may already have retired this node; retry retrieves the
+    /// retained result and never resumes admission or abandons accepted writes.
+    pub async fn prepare_shutdown(
+        &self,
+        to: Option<C::NodeId>,
+    ) -> Result<Option<TransferLeaderRequest<C::NodeId>>, RaftError<C::NodeId, TransferLeaderError>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::PrepareShutdown { to, tx }, rx).await
+    }
+
+    /// Accept a handoff from the authenticated current leader.
+    ///
+    /// Validate transport identity against `request.from()` before calling.
+    /// The engine rechecks the exact vote, committed stable membership, target
+    /// eligibility and the target's applied log prefix in one core turn. Only
+    /// the intended voter campaigns; other voters release the retiring vote's
+    /// election lease. An in-flight heartbeat cannot restore that lease.
+    ///
+    /// A lagging target returns `LogNotApplied` without any effect. Its caller
+    /// may wait for ordinary replication progress and redeliver this same
+    /// handoff under its original deadline. No application mutation is replayed.
+    pub async fn handle_leadership_transfer(
+        &self,
+        request: TransferLeaderRequest<C::NodeId>,
+    ) -> Result<(), RaftError<C::NodeId, TransferLeaderError>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::HandleLeadershipTransfer { request, tx }, rx).await
     }
 
     /// Get the latest snapshot from the state machine.

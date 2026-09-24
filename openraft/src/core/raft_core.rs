@@ -1185,6 +1185,18 @@ where
 
                 self.change_membership(changes, retain, tx);
             }
+            RaftMsg::BeginLeadershipTransfer { to, tx } => {
+                let result = self.engine.begin_leadership_transfer(to);
+                let _ = tx.send(result);
+            }
+            RaftMsg::PrepareShutdown { to, tx } => {
+                let result = self.engine.prepare_shutdown(to);
+                let _ = tx.send(result);
+            }
+            RaftMsg::HandleLeadershipTransfer { request, tx } => {
+                let result = self.engine.handle_leadership_transfer(request);
+                let _ = tx.send(result);
+            }
             RaftMsg::ExternalCoreRequest { req } => {
                 req(&self.engine.state);
             }

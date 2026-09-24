@@ -38,6 +38,9 @@ where C: RaftTypeConfig
     /// `self.voting` may be in progress requesting vote for a higher vote.
     pub(crate) vote: Vote<C::NodeId>,
 
+    /// Proposals, reads and heartbeats stop while this vote is handed off.
+    pub(crate) transfer_to: Option<C::NodeId>,
+
     last_log_id: Option<LogId<C::NodeId>>,
 
     /// The log id of the first log entry proposed by this leader,
@@ -109,6 +112,7 @@ where
         let last_log_id = last_leader_log_id.last().cloned();
 
         Self {
+            transfer_to: None,
             vote,
             last_log_id: last_log_id.clone(),
             noop_log_id,

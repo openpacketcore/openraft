@@ -5,6 +5,7 @@
 
 mod append_entries;
 mod install_snapshot;
+mod transfer_leader;
 mod vote;
 
 mod client_write;
@@ -16,5 +17,7 @@ pub use client_write::ClientWriteResult;
 pub use install_snapshot::InstallSnapshotRequest;
 pub use install_snapshot::InstallSnapshotResponse;
 pub use install_snapshot::SnapshotResponse;
+pub use transfer_leader::TransferLeaderError;
+pub use transfer_leader::TransferLeaderRequest;
 pub use vote::VoteRequest;
 pub use vote::VoteResponse;
