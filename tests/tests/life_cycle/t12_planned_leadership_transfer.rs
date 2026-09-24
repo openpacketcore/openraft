@@ -2,21 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use anyerror::AnyError;
 use maplit::btreeset;
 use openraft::error::ClientWriteError;
-use openraft::error::NetworkError;
-use openraft::error::RPCError;
 use openraft::error::RaftError;
 use openraft::raft::TransferLeaderError;
 use openraft::Config;
-use openraft::RPCTypes;
 use openraft::ServerState;
 use openraft_memstore::ClientRequest;
 use openraft_memstore::IntoMemClientRequest;
 
 use crate::fixtures::init_default_ut_tracing;
-use crate::fixtures::RPCRequest;
 use crate::fixtures::RaftRouter;
 
 const HANDOFF_BUDGET: Duration = Duration::from_secs(5);
@@ -129,17 +124,10 @@ async fn handoff_retains_pending_write_and_refuses_unapplied_target() -> anyhow:
     let old = router.get_raft_handle(&0)?;
     let next = router.get_raft_handle(&1)?;
     let other = router.get_raft_handle(&2)?;
-    router.set_rpc_pre_hook(RPCTypes::AppendEntries, |_router, rpc, from, _to| {
-        if from == 0 && matches!(rpc, RPCRequest::AppendEntries(ref request) if !request.entries.is_empty()) {
-            return Err(RPCError::Network(NetworkError::new(&AnyError::error(
-                "synthetic replication gate",
-            ))));
-        }
-        Ok(())
-    });
+    router.set_network_error(0, true);
 
     // Submit once, preserve the original response receiver across the handoff,
-    // and pause only replication. It is admitted but cannot yet be committed.
+    // and pause the old leader's network. It is admitted but cannot yet be committed.
     let pending = old.client_write_ff(ClientRequest::make_request("pending", 1)).await?;
     old.wait(Some(HANDOFF_BUDGET)).log_index(Some(log_index + 1), "accepted before handoff").await?;
     let request = old.prepare_shutdown(Some(1)).await?.unwrap();
@@ -150,7 +138,7 @@ async fn handoff_retains_pending_write_and_refuses_unapplied_target() -> anyhow:
     assert_eq!(vote_before, next.metrics().borrow().vote);
     assert!(old.ensure_linearizable().await.is_err());
 
-    router.rpc_pre_hook(RPCTypes::AppendEntries, None);
+    router.set_network_error(0, false);
     let result = tokio::time::timeout(HANDOFF_BUDGET, async {
         let reply = pending.await??;
         assert_eq!(log_index + 1, reply.log_id.index, "the original mutation settles once");
