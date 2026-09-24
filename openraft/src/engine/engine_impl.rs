@@ -19,6 +19,7 @@ use crate::engine::handler::replication_handler::SendNone;
 use crate::engine::handler::server_state_handler::ServerStateHandler;
 use crate::engine::handler::snapshot_handler::SnapshotHandler;
 use crate::engine::handler::vote_handler::VoteHandler;
+use crate::engine::leadership_transfer::PreparedShutdown;
 use crate::engine::Command;
 use crate::engine::EngineOutput;
 use crate::engine::Respond;
@@ -90,6 +91,9 @@ where C: RaftTypeConfig
     /// without losing leadership status.
     pub(crate) candidate: CandidateState<C>,
 
+    /// Retirement is irreversible for this engine instance, including after a new vote.
+    pub(crate) prepared_shutdown: Option<PreparedShutdown<C::NodeId>>,
+
     /// Output entry for the runtime.
     pub(crate) output: EngineOutput<C>,
 }
@@ -107,6 +111,7 @@ where C: RaftTypeConfig
             seen_greater_log: false,
             leader: None,
             candidate: None,
+            prepared_shutdown: None,
             output: EngineOutput::new(4096),
         }
     }
@@ -216,6 +221,9 @@ where C: RaftTypeConfig
     /// Start to elect this node as leader
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn elect(&mut self) {
+        if self.prepared_shutdown.is_some() {
+            return;
+        }
         // A campaign consumes the timeout selected for it. Select a new timeout
         // for the next campaign so repeated split votes do not remain in lockstep.
         self.config.resample_election_timeout::<C::AsyncRuntime>();
@@ -297,11 +305,11 @@ where C: RaftTypeConfig
             vote_utime + lease - now
         );
 
-        if vote.is_committed() {
+        if vote.is_committed() && !self.state.vote.lease_disabled() {
             // Current leader lease has not yet expired, reject voting request
             if now <= vote_utime + lease {
                 tracing::info!(
-                    "reject vote-request: leader lease has not yet expire; now; {:?}, vote is updatd at: {:?}, leader lease({:?}) will expire after {:?}",
+                    "reject vote-request: leader lease has not yet expired; now; {:?}, vote is updated at: {:?}, leader lease({:?}) will expire after {:?}",
                     now,
                     vote_utime,
                     lease,
@@ -775,6 +783,17 @@ where C: RaftTypeConfig
         // and do not consider the vote in the local RaftState.
         if !leader.vote.is_committed() {
             return Err(self.state.forward_to_leader());
+        }
+
+        if let Some(to) = leader.transfer_to.as_ref() {
+            return Err(ForwardToLeader {
+                leader_id: Some(to.clone()),
+                leader_node: self.state.membership_state.effective().get_node(to).cloned(),
+            });
+        }
+
+        if self.prepared_shutdown.is_some() {
+            return Err(ForwardToLeader::empty());
         }
 
         Ok(LeaderHandler {

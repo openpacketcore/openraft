@@ -347,7 +347,7 @@ where C: RaftTypeConfig
     pub(crate) fn rebuild_replication_streams(&mut self) {
         let mut targets = vec![];
 
-        // TODO: maybe it's better to update leader's matching when update_repliation() is called.
+        // TODO: maybe it's better to update leader's matching when update_replication() is called.
         for (target, prog_entry) in self.leader.progress.iter_mut() {
             if target != &self.config.id {
                 // Reset and resend(by self.send_to_all()) replication requests.

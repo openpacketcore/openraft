@@ -606,17 +606,17 @@ where
         // but not `RaftDataMetrics` and `RaftServerMetrics`.
         // Thus if `RaftMetrics` change is perceived, the other two should have been updated.
 
-        self.tx_data_metrics.send_if_modified(|metrix| {
-            if data_metrics.ne(metrix) {
-                *metrix = data_metrics.clone();
+        self.tx_data_metrics.send_if_modified(|metrics| {
+            if data_metrics.ne(metrics) {
+                *metrics = data_metrics.clone();
                 return true;
             }
             false
         });
 
-        self.tx_server_metrics.send_if_modified(|metrix| {
-            if server_metrics.ne(metrix) {
-                *metrix = server_metrics.clone();
+        self.tx_server_metrics.send_if_modified(|metrics| {
+            if server_metrics.ne(metrics) {
+                *metrics = server_metrics.clone();
                 return true;
             }
             false
@@ -1184,6 +1184,18 @@ where
                 );
 
                 self.change_membership(changes, retain, tx);
+            }
+            RaftMsg::BeginLeadershipTransfer { to, tx } => {
+                let result = self.engine.begin_leadership_transfer(to);
+                let _ = tx.send(result);
+            }
+            RaftMsg::PrepareShutdown { to, tx } => {
+                let result = self.engine.prepare_shutdown(to);
+                let _ = tx.send(result);
+            }
+            RaftMsg::HandleLeadershipTransfer { request, tx } => {
+                let result = self.engine.handle_leadership_transfer(request);
+                let _ = tx.send(result);
             }
             RaftMsg::ExternalCoreRequest { req } => {
                 req(&self.engine.state);
