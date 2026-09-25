@@ -52,6 +52,29 @@ The [`RaftStateMachine`] encapsulates several critical responsibilities:
   `last-applied-log-id`.
 
 
+## Bounded apply pages
+
+`Config::max_apply_entries` optionally bounds each runtime apply read. Unset
+preserves the original behavior. When enabled, Openraft asks the storage
+`limited_get_log_entries` reader for at most that many entries; the reader may
+return a shorter nonempty prefix because of its byte limit. Storage must return
+contiguous, complete entries and retain any per-operation deadline across pages.
+
+The core retains one active committed range and one coalesced pending range,
+loads one page, and consumes its ordered responses before loading another.
+Partial pages advance the applied log frontier, but do not complete the whole
+state-machine command. Every accepted entry still gets one ordered result.
+Durable replication acknowledgements do not wait for application. Snapshot
+commands, log purges and conflict truncations remain ordering barriers; their
+waits return to the normal event loop so remaining pages can make progress.
+Existing replication-task joins remain in effect when leadership changes.
+
+This option bounds apply entry and response populations, not process RSS.
+Applications must separately bound individual entries/results, API admission,
+cancelled accepted work, peer fan-out, transport, snapshots and storage caches.
+It does not change the stored log or snapshot format, a storage durability
+mode, election settings, operation deadlines, or replication payload limits.
+
 [`RaftStateMachine`]:         `crate::storage::RaftStateMachine`
 [`apply`]:                    `crate::storage::RaftStateMachine::apply`
 [`applied_state`]:            `crate::storage::RaftStateMachine::applied_state`

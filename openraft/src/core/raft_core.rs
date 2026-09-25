@@ -766,6 +766,38 @@ where
         Ok(())
     }
 
+    /// Dispatch one bounded page, only after the previous response was consumed.
+    /// The worker never waits for a core acknowledgement, so replication joins
+    /// and snapshot-reader requests cannot create a response-channel deadlock.
+    async fn drive_bounded_apply(&mut self) -> Result<(), StorageError<C::NodeId>> {
+        let Some(limit) = self.config.max_apply_entries else {
+            return Ok(());
+        };
+        let Some((seq, since, end)) = self.command_state.bounded_apply.next_page(limit) else {
+            return Ok(());
+        };
+        let entries = self.log_store.limited_get_log_entries(since, end).await?;
+        let invalid = || StorageIOError::read_log_at_index(since, AnyError::error("invalid bounded apply page"));
+        let count = u64::try_from(entries.len()).map_err(|_| invalid())?;
+        if count == 0
+            || count > end - since
+            || entries.iter().enumerate().any(|(offset, entry)| entry.get_log_id().index != since + offset as u64)
+        {
+            return Err(invalid().into());
+        }
+        // Nonempty, contiguous and wholly within the requested range.
+        let last_applied = entries.last().unwrap().get_log_id().clone();
+        let page_end = last_applied.index.checked_add(1).ok_or_else(invalid)?;
+        self.sm_handle
+            .send(sm::Command::apply(entries).with_seq(seq))
+            .map_err(|e| StorageIOError::apply(last_applied, AnyError::error(e)))?;
+        self.command_state
+            .bounded_apply
+            .sent_page(page_end)
+            .map_err(|e| StorageIOError::write_state_machine(AnyError::error(e)))?;
+        Ok(())
+    }
+
     /// When received results of applying log entries to the state machine, send back responses to
     /// the callers that proposed the entries.
     #[tracing::instrument(level = "debug", skip_all)]
@@ -869,6 +901,7 @@ where
     /// next RaftMsg.
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn run_engine_commands(&mut self) -> Result<(), StorageError<C::NodeId>> {
+        self.drive_bounded_apply().await?;
         if tracing::enabled!(Level::DEBUG) {
             tracing::debug!("queued commands: start...");
             for c in self.engine.output.iter_commands() {
@@ -1378,20 +1411,46 @@ where
                 let seq = command_result.command_seq;
                 let res = command_result.result?;
 
-                match res {
-                    // BuildSnapshot is a read operation that does not have to be serialized by
-                    // sm::Worker. Thus it may finish out of order.
-                    sm::Response::BuildSnapshot(_) => {}
-                    _ => {
-                        debug_assert!(
-                            self.command_state.finished_sm_seq < seq,
-                            "sm::StateMachine command result is out of order: expect {} < {}",
-                            self.command_state.finished_sm_seq,
-                            seq
-                        );
+                let complete = if self.config.max_apply_entries.is_some() {
+                    match &res {
+                        sm::Response::Apply(page) => {
+                            let count = page.end.checked_sub(page.since).and_then(|n| usize::try_from(n).ok());
+                            if count != Some(page.applying_entries.len()) || count != Some(page.apply_results.len()) {
+                                return Err(StorageError::from(StorageIOError::write_state_machine(AnyError::error(
+                                    "invalid bounded apply response count",
+                                )))
+                                .into());
+                            }
+                            self.command_state
+                                .bounded_apply
+                                .complete_page(seq, page.since, page.end)
+                                .map_err(|e| {
+                                    StorageError::from(StorageIOError::write_state_machine(AnyError::error(e)))
+                                })?
+                                .is_some()
+                        }
+                        // Read-only snapshot builders can finish out of order.
+                        // They must not move the command frontier backwards.
+                        sm::Response::BuildSnapshot(_) => false,
+                        sm::Response::InstallSnapshot(_) => true,
                     }
+                } else {
+                    true
+                };
+                if complete {
+                    match &res {
+                        sm::Response::BuildSnapshot(_) => {}
+                        _ => {
+                            debug_assert!(
+                                self.command_state.finished_sm_seq < seq,
+                                "sm::StateMachine command result is out of order: expect {} < {}",
+                                self.command_state.finished_sm_seq,
+                                seq
+                            );
+                        }
+                    }
+                    self.command_state.finished_sm_seq = seq;
                 }
-                self.command_state.finished_sm_seq = seq;
 
                 match res {
                     sm::Response::BuildSnapshot(meta) => {
@@ -1591,6 +1650,18 @@ where
     SM: RaftStateMachine<C>,
 {
     async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, StorageError<C::NodeId>> {
+        // The SDK log adapter may wait for applied progress before removing
+        // committed rows. Postpone here, where the normal event loop can consume
+        // apply responses and dispatch the remaining pages. Never block inside
+        // truncation while a later page still needs the core to dispatch it.
+        if self.command_state.bounded_apply.is_pending()
+            && matches!(
+                &cmd,
+                Command::StateMachine { .. } | Command::PurgeLog { .. } | Command::DeleteConflictLog { .. }
+            )
+        {
+            return Ok(Some(cmd));
+        }
         let condition = cmd.condition();
         tracing::debug!("condition: {:?}", condition);
 
@@ -1699,7 +1770,20 @@ where
                 ref upto,
             } => {
                 self.log_store.save_committed(Some(upto.clone())).await?;
-                self.apply_to_state_machine(seq, already_committed.next_index(), upto.index).await?;
+                if self.config.max_apply_entries.is_some() {
+                    let end = upto.index.checked_add(1).ok_or_else(|| {
+                        StorageIOError::write_state_machine(AnyError::error("bounded apply range overflow"))
+                    })?;
+                    self.command_state
+                        .bounded_apply
+                        .enqueue(seq, already_committed.next_index(), end)
+                        .map_err(|e| StorageIOError::write_state_machine(AnyError::error(e)))?;
+                    self.drive_bounded_apply().await?;
+                    // Acknowledge durable replication as before. It does not
+                    // wait for this committed range to finish applying.
+                } else {
+                    self.apply_to_state_machine(seq, already_committed.next_index(), upto.index).await?;
+                }
             }
             Command::Replicate { req, target } => {
                 let node = self.replications.get(&target).expect("replication to target node exists");
