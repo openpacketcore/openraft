@@ -1580,9 +1580,20 @@ async fn accepted_client_failure_completes_before_retired_reader_cleanup() -> Re
     let fixture = Fixture::new().await?;
     let result = async {
         let old = fixture.retired_reader().await?;
+        let append_gate = fixture.probe.arm_append();
         fixture.probe.fail_append.store(true, Ordering::SeqCst);
         let mut write = std::pin::pin!(fixture.raft.client_write(ClientRequest::make_request("fatal-response", 1)));
         anyhow::ensure!(futures::poll!(&mut write).is_pending());
+        observed(
+            &append_gate.entered,
+            "ACCEPTED_FATAL_SETUP: accepted write did not reach the held append",
+        )
+        .await?;
+        anyhow::ensure!(
+            !*fixture.probe.failed_append.borrow() && !*old.dropped.borrow(),
+            "ACCEPTED_FATAL_SETUP: failure or cleanup ran before the held append was released"
+        );
+        append_gate.release.close();
         observed(&fixture.probe.failed_append, "synthetic append failure was not reached").await?;
         // client_write_ff has already moved this responder out of rx_api and into
         // the core's indexed client responders before the append fails.
@@ -2383,6 +2394,160 @@ async fn retired_snapshot_cancellation_network_and_remote_errors_remain_nonfatal
             fixture.raft.metrics().borrow().running_state == Err(Fatal::Stopped),
             "RETIRED_SNAPSHOT_NONFATAL_OUTCOME: normal shutdown retained a false fatal for {outcome:?}"
         );
+    }
+    Ok(())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn accepted_linearizable_wait_observes_fatal_before_retired_reader_cleanup() -> Result<()> {
+    for bound in [None, NonZeroU64::new(2)] {
+        let fixture = Fixture::with_apply_bound(bound).await?;
+        let result = async {
+            let old = fixture.retired_reader().await?;
+            let apply_gate = fixture.probe.arm_apply();
+            let _accepted_receiver = within(
+                fixture.raft.client_write_ff(ClientRequest::make_request("read-wait", 1)),
+                "LINEARIZABLE_FATAL_SETUP: accept write whose actual apply is held",
+            )
+            .await??;
+            observed(
+                &apply_gate.entered,
+                "LINEARIZABLE_FATAL_SETUP: actual committed apply was not held",
+            )
+            .await?;
+            let (read_log_id, applied) = within(
+                fixture.raft.get_read_log_id(),
+                "LINEARIZABLE_FATAL_SETUP: single-voter read index did not complete",
+            )
+            .await??;
+            anyhow::ensure!(
+                read_log_id > applied && applied == fixture.raft.metrics().borrow().last_applied,
+                "LINEARIZABLE_FATAL_SETUP: committed read index is not above applied state"
+            );
+
+            let mut read = std::pin::pin!(fixture.raft.ensure_linearizable());
+            anyhow::ensure!(futures::poll!(&mut read).is_pending());
+            // The single-voter check sends its read-index reply synchronously.
+            // This later FIFO API proves that reply was sent; polling read again
+            // consumes it and reaches the separate metrics/application wait.
+            within(
+                fixture.raft.with_raft_state(|_| ()),
+                "LINEARIZABLE_FATAL_SETUP: read-index response was not dispatched",
+            )
+            .await??;
+            anyhow::ensure!(
+                futures::poll!(&mut read).is_pending()
+                    && fixture.raft.metrics().borrow().running_state.is_ok()
+                    && !apply_gate.release.is_closed()
+                    && !*old.dropped.borrow(),
+                "LINEARIZABLE_FATAL_SETUP: read did not reach the healthy apply wait"
+            );
+
+            fixture.probe.fail_append.store(true, Ordering::SeqCst);
+            let error = match within(
+                fixture.raft.client_write(ClientRequest::make_request("read-wait-fatal", 1)),
+                "LINEARIZABLE_FATAL_SETUP: independent append did not report its failure",
+            )
+            .await?
+            {
+                Err(RaftError::Fatal(Fatal::StorageError(error))) => error,
+                other => anyhow::bail!("LINEARIZABLE_FATAL_SETUP: wrong append outcome: {other:?}"),
+            };
+            anyhow::ensure!(*fixture.probe.failed_append.borrow() && error.to_string().contains(FAULT));
+            let response = within(
+                &mut read,
+                "LINEARIZABLE_FATAL_COMPLETION: accepted read waited for retained cleanup",
+            )
+            .await?;
+            anyhow::ensure!(
+                matches!(response, Err(RaftError::Fatal(Fatal::StorageError(ref actual))) if actual == &error),
+                "LINEARIZABLE_FATAL_IDENTITY: accepted read lost the original storage failure: {response:?}"
+            );
+            anyhow::ensure!(
+                !apply_gate.release.is_closed() && !*old.dropped.borrow(),
+                "LINEARIZABLE_FATAL_OWNERSHIP: API completion cancelled retained storage"
+            );
+            apply_gate.release.close();
+            finish_reader_fatal(&fixture, &old, &error, "LINEARIZABLE_FATAL_READER_OWNERSHIP").await
+        }
+        .await;
+        let cleanup = fixture.stop().await;
+        result.with_context(|| format!("accepted linearizable apply wait, bound {bound:?}"))?;
+        cleanup?;
+    }
+    Ok(())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn accepted_linearizable_wait_preserves_applied_success_after_later_fatal() -> Result<()> {
+    for bound in [None, NonZeroU64::new(2)] {
+        let fixture = Fixture::with_apply_bound(bound).await?;
+        let result = async {
+            let old = fixture.retired_reader().await?;
+            let apply_gate = fixture.probe.arm_apply();
+            let _accepted_receiver = within(
+                fixture.raft.client_write_ff(ClientRequest::make_request("read-success", 1)),
+                "LINEARIZABLE_READY_SETUP: accept write whose actual apply is held",
+            )
+            .await??;
+            observed(
+                &apply_gate.entered,
+                "LINEARIZABLE_READY_SETUP: actual apply was not held",
+            )
+            .await?;
+            let (read_log_id, applied) = within(
+                fixture.raft.get_read_log_id(),
+                "LINEARIZABLE_READY_SETUP: read index did not complete",
+            )
+            .await??;
+            anyhow::ensure!(read_log_id > applied);
+            let required = read_log_id.expect("read index above an applied state must exist");
+            let mut read = std::pin::pin!(fixture.raft.ensure_linearizable());
+            anyhow::ensure!(futures::poll!(&mut read).is_pending());
+            within(
+                fixture.raft.with_raft_state(|_| ()),
+                "LINEARIZABLE_READY_SETUP: read-index response was not dispatched",
+            )
+            .await??;
+            anyhow::ensure!(futures::poll!(&mut read).is_pending());
+
+            // Leave the public read unpolled while actual application completes,
+            // then while an independent append fails. Its already-satisfied read
+            // condition must win over the later fatal when it is next polled.
+            apply_gate.release.close();
+            within(
+                fixture.raft.wait(None).applied_index_at_least(Some(required.index), "read index applied"),
+                "LINEARIZABLE_READY_SETUP: required read index was not actually applied",
+            )
+            .await??;
+            anyhow::ensure!(fixture.store.get_state_machine().await.last_applied_log >= read_log_id);
+            fixture.probe.fail_append.store(true, Ordering::SeqCst);
+            let error = match within(
+                fixture.raft.client_write(ClientRequest::make_request("read-success-fatal", 1)),
+                "LINEARIZABLE_READY_SETUP: independent append did not report its failure",
+            )
+            .await?
+            {
+                Err(RaftError::Fatal(Fatal::StorageError(error))) => error,
+                other => anyhow::bail!("LINEARIZABLE_READY_SETUP: wrong append outcome: {other:?}"),
+            };
+            anyhow::ensure!(*fixture.probe.failed_append.borrow() && error.to_string().contains(FAULT));
+            anyhow::ensure!(!*old.dropped.borrow());
+            let response = within(
+                &mut read,
+                "LINEARIZABLE_READY_COMPLETION: applied read remained pending",
+            )
+            .await?;
+            anyhow::ensure!(
+                matches!(response, Ok(actual) if actual == read_log_id),
+                "LINEARIZABLE_READY_PRECEDENCE: later fatal replaced an already-applied read: {response:?}"
+            );
+            finish_reader_fatal(&fixture, &old, &error, "LINEARIZABLE_READY_READER_OWNERSHIP").await
+        }
+        .await;
+        let cleanup = fixture.stop().await;
+        result.with_context(|| format!("already-applied linearizable wait, bound {bound:?}"))?;
+        cleanup?;
     }
     Ok(())
 }
