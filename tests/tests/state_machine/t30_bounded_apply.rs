@@ -656,6 +656,12 @@ async fn assert_invalid_response_stops_worker_and_client(mode: ResponseMode) -> 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     node.gate.add_permits(8);
     tokio::time::timeout_at(deadline, node.raft.initialize(btreeset! {0})).await??;
+    // Initialization starts an election; its response does not establish leadership.
+    tokio::time::timeout_at(
+        deadline,
+        node.raft.wait(None).current_leader(0, "ready for response fault injection"),
+    )
+    .await??;
     let initial = tokio::time::timeout_at(
         deadline,
         node.raft.client_write(ClientRequest::make_request("client", 0)),
