@@ -19,8 +19,10 @@ use anyhow::Result;
 use maplit::btreeset;
 use openraft::error::Fatal;
 use openraft::error::InstallSnapshotError;
+use openraft::error::NetworkError;
 use openraft::error::RPCError;
 use openraft::error::RaftError;
+use openraft::error::RemoteError;
 use openraft::error::ReplicationClosed;
 use openraft::error::StreamingError;
 use openraft::network::RPCOption;
@@ -75,7 +77,9 @@ const PROGRESS: Duration = Duration::from_millis(1_500);
 const HELD: Duration = Duration::from_millis(100);
 const RPC_TIMEOUT: u64 = 5_000;
 const FAULT: &str = "synthetic retirement append failure";
+const VOTE_FAULT: &str = "synthetic retirement vote persistence failure";
 const SNAPSHOT_FAULT: &str = "synthetic retirement snapshot read failure";
+const STREAMED_SNAPSHOT_FAULT: &str = "synthetic retiring snapshot data read failure";
 
 trait FixtureConfig:
     RaftTypeConfig<
@@ -229,7 +233,42 @@ struct SnapshotGate {
     dropped: watch::Sender<bool>,
     release: Semaphore,
     panic_on_release: AtomicBool,
+    storage_error_on_release: AtomicBool,
+    returned_storage_error: watch::Sender<Option<StorageError<u64>>>,
+    nonfatal_on_release: Mutex<Option<NonfatalSnapshotError>>,
     tail: Mutex<Option<Arc<WorkGate>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NonfatalSnapshotError {
+    Network,
+    RemoteStorage,
+}
+
+struct SnapshotReadGate {
+    entered: watch::Sender<bool>,
+    finished: watch::Sender<bool>,
+    release: Semaphore,
+}
+
+impl SnapshotReadGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: watch::channel(false).0,
+            finished: watch::channel(false).0,
+            release: Semaphore::new(0),
+        })
+    }
+}
+
+// This records the end of the actual storage future, including cancellation.
+// The future also retains its real snapshot result across the gate below.
+struct SnapshotReadOwner(Arc<SnapshotReadGate>);
+
+impl Drop for SnapshotReadOwner {
+    fn drop(&mut self) {
+        self.0.finished.send_replace(true);
+    }
 }
 
 struct WorkGate {
@@ -260,6 +299,9 @@ impl SnapshotGate {
             dropped: watch::channel(false).0,
             release: Semaphore::new(0),
             panic_on_release: AtomicBool::new(false),
+            storage_error_on_release: AtomicBool::new(false),
+            returned_storage_error: watch::channel(None).0,
+            nonfatal_on_release: Mutex::new(None),
             tail: Mutex::new(None),
         })
     }
@@ -301,8 +343,12 @@ struct Probe {
     fail_append: AtomicBool,
     failed_append: watch::Sender<bool>,
     fail_snapshot: AtomicBool,
+    armed_snapshot_read: Mutex<Option<Arc<SnapshotReadGate>>>,
+    snapshot_reads: Mutex<Vec<Arc<SnapshotReadGate>>>,
     armed_apply: Mutex<Option<Arc<WorkGate>>>,
     armed_append: Mutex<Option<Arc<WorkGate>>>,
+    armed_vote_failure: Mutex<Option<Arc<WorkGate>>>,
+    failed_vote: watch::Sender<bool>,
     work_gates: Mutex<Vec<Arc<WorkGate>>>,
     panic_rpc: Mutex<Option<u64>>,
 }
@@ -322,8 +368,12 @@ impl Probe {
             fail_append: AtomicBool::new(false),
             failed_append: watch::channel(false).0,
             fail_snapshot: AtomicBool::new(false),
+            armed_snapshot_read: Mutex::new(None),
+            snapshot_reads: Mutex::new(Vec::new()),
             armed_apply: Mutex::new(None),
             armed_append: Mutex::new(None),
+            armed_vote_failure: Mutex::new(None),
+            failed_vote: watch::channel(false).0,
             work_gates: Mutex::new(Vec::new()),
             panic_rpc: Mutex::new(None),
         })
@@ -347,6 +397,13 @@ impl Probe {
         let gate = WorkGate::new();
         assert!(self.armed_apply.lock().unwrap().replace(gate.clone()).is_none());
         self.work_gates.lock().unwrap().push(gate.clone());
+        gate
+    }
+
+    fn arm_snapshot_read(&self) -> Arc<SnapshotReadGate> {
+        let gate = SnapshotReadGate::new();
+        assert!(self.armed_snapshot_read.lock().unwrap().replace(gate.clone()).is_none());
+        self.snapshot_reads.lock().unwrap().push(gate.clone());
         gate
     }
 
@@ -399,6 +456,9 @@ impl Probe {
             gate.release.close();
         }
         for gate in self.work_gates.lock().unwrap().iter() {
+            gate.release.close();
+        }
+        for gate in self.snapshot_reads.lock().unwrap().iter() {
             gate.release.close();
         }
     }
@@ -490,6 +550,16 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
     type SnapshotBuilder = ObservedBuilder;
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        let gate = self.probe.armed_vote_failure.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.enter().await;
+            self.probe.failed_vote.send_replace(true);
+            return Err(StorageError::from_io_error(
+                ErrorSubject::Vote,
+                ErrorVerb::Write,
+                std::io::Error::other(VOTE_FAULT),
+            ));
+        }
         self.inner.save_vote(vote).await
     }
 
@@ -592,6 +662,21 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
+        let gate = self.probe.armed_snapshot_read.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let snapshot = self.inner.get_current_snapshot().await?;
+            assert!(
+                snapshot.is_some(),
+                "HELD_SM_GET_SNAPSHOT_SETUP: no actual snapshot to retain"
+            );
+            let _owner = SnapshotReadOwner(gate.clone());
+            gate.entered.send_replace(true);
+            let _ = gate.release.acquire().await;
+            return Ok(snapshot.map(|snapshot| Snapshot {
+                meta: snapshot.meta,
+                snapshot: snapshot.snapshot,
+            }));
+        }
         if self.probe.fail_snapshot.swap(false, Ordering::SeqCst) {
             return Err(StorageError::from_io_error(
                 ErrorSubject::Snapshot(None),
@@ -743,6 +828,35 @@ impl<C: FixtureConfig> RaftNetwork<C> for ObservedConnection {
         // Retain and use the actual supplied data after observing cancellation.
         assert!(!owned.snapshot.as_ref().unwrap().snapshot.get_ref().is_empty());
         drop(owned);
+        if gate.storage_error_on_release.load(Ordering::SeqCst) {
+            // Model a real local snapshot-data seek/read that was pending when
+            // cancellation was requested, then completed with an I/O failure.
+            let error = StorageError::from_io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                std::io::Error::other(STREAMED_SNAPSHOT_FAULT),
+            );
+            gate.returned_storage_error.send_replace(Some(error.clone()));
+            return Err(StreamingError::StorageError(error));
+        }
+        match *gate.nonfatal_on_release.lock().unwrap() {
+            Some(NonfatalSnapshotError::Network) => {
+                return Err(StreamingError::Network(NetworkError::new(&std::io::Error::other(
+                    "synthetic retired snapshot network failure",
+                ))));
+            }
+            Some(NonfatalSnapshotError::RemoteStorage) => {
+                return Err(StreamingError::RemoteError(RemoteError::new(
+                    self.target,
+                    Fatal::StorageError(StorageError::from_io_error(
+                        ErrorSubject::Snapshot(None),
+                        ErrorVerb::Read,
+                        std::io::Error::other("synthetic remote snapshot storage failure"),
+                    )),
+                )));
+            }
+            None => {}
+        }
         Err(StreamingError::Closed(cancelled))
     }
 }
@@ -1388,6 +1502,59 @@ async fn snapshot_api_preserves_fatal_storage_error_while_retired_reader_cleanup
             metrics.state != ServerState::Shutdown && !*old.dropped.borrow(),
             "RETIRED_FATAL_OWNERSHIP: fatal publication claimed completed shutdown before cleanup"
         );
+        // A new API call must observe the same known failure while the actual
+        // retained reader is still owned and shutdown has not completed.
+        let next = within(
+            fixture.raft.get_snapshot(),
+            "POST_FATAL_API_COMPLETION: new snapshot API waited for retained cleanup after failure was published",
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(next, Err(RaftError::Fatal(Fatal::StorageError(ref next_error))) if next_error == &error),
+            "POST_FATAL_API_COMPLETION: new snapshot API did not preserve the original failure: {next:?}"
+        );
+
+        let inspected = Arc::new(AtomicBool::new(false));
+        let called = inspected.clone();
+        let state = within(
+            fixture.raft.with_raft_state(move |_| called.store(true, Ordering::SeqCst)),
+            "POST_FATAL_STATE_COMPLETION: state inspection waited for retained cleanup",
+        )
+        .await?;
+        anyhow::ensure!(
+            state == Err(Fatal::StorageError(error.clone())) && !inspected.load(Ordering::SeqCst),
+            "POST_FATAL_STATE_COMPLETION: state inspection lost the original failure or executed after failure: {state:?}"
+        );
+        let write = within(
+            fixture.raft.client_write(ClientRequest::make_request("post-fatal", 1)),
+            "POST_FATAL_WRITE_COMPLETION: client write waited for retained cleanup",
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(write, Err(RaftError::Fatal(Fatal::StorageError(ref write_error))) if write_error == &error),
+            "POST_FATAL_WRITE_COMPLETION: client write lost the original failure: {write:?}"
+        );
+        let submit = within(
+            fixture.raft.client_write_ff(ClientRequest::make_request("post-fatal", 2)),
+            "POST_FATAL_FF_COMPLETION: fire-and-forget submission waited for retained cleanup",
+        )
+        .await?;
+        // After a known fatal, submission itself must refuse. A previously
+        // accepted custom responder still retains its application-defined contract.
+        anyhow::ensure!(
+            matches!(submit, Err(Fatal::StorageError(ref submit_error)) if submit_error == &error),
+            "POST_FATAL_FF_COMPLETION: fire-and-forget submission accepted work or lost the original failure"
+        );
+        let trigger = within(
+            fixture.raft.trigger().heartbeat(),
+            "POST_FATAL_TRIGGER_COMPLETION: external command waited for retained cleanup",
+        )
+        .await?;
+        anyhow::ensure!(
+            trigger == Err(Fatal::StorageError(error.clone())),
+            "POST_FATAL_TRIGGER_COMPLETION: external command accepted work or lost the original failure: {trigger:?}"
+        );
+        anyhow::ensure!(!*old.dropped.borrow());
         let mut shutdown = std::pin::pin!(fixture.raft.shutdown());
         anyhow::ensure!(
             tokio::time::timeout(HELD, &mut shutdown).await.is_err(),
@@ -1395,6 +1562,50 @@ async fn snapshot_api_preserves_fatal_storage_error_while_retired_reader_cleanup
         );
         old.release();
         within(&mut shutdown, "fatal cleanup after reader release").await??;
+        anyhow::ensure!(*old.dropped.borrow());
+        let metrics = fixture.raft.metrics().borrow().clone();
+        anyhow::ensure!(
+            metrics.state == ServerState::Shutdown && metrics.running_state == Err(Fatal::StorageError(error))
+        );
+        fixture.assert_quiet().await
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn accepted_client_failure_completes_before_retired_reader_cleanup() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let old = fixture.retired_reader().await?;
+        fixture.probe.fail_append.store(true, Ordering::SeqCst);
+        let mut write = std::pin::pin!(fixture.raft.client_write(ClientRequest::make_request("fatal-response", 1)));
+        anyhow::ensure!(futures::poll!(&mut write).is_pending());
+        observed(&fixture.probe.failed_append, "synthetic append failure was not reached").await?;
+        // client_write_ff has already moved this responder out of rx_api and into
+        // the core's indexed client responders before the append fails.
+        let response = within(
+            &mut write,
+            "ACCEPTED_FATAL_API_COMPLETION: accepted client response waited for retained cleanup",
+        )
+        .await?;
+        let error = match response {
+            Err(RaftError::Fatal(Fatal::StorageError(error))) => error,
+            other => anyhow::bail!("ACCEPTED_FATAL_API_COMPLETION: client lost the original failure: {other:?}"),
+        };
+        anyhow::ensure!(error.to_string().contains(FAULT));
+        let metrics = fixture.raft.metrics().borrow().clone();
+        anyhow::ensure!(metrics.running_state == Err(Fatal::StorageError(error.clone())));
+        anyhow::ensure!(metrics.state != ServerState::Shutdown && !*old.dropped.borrow());
+        let mut shutdown = std::pin::pin!(fixture.raft.shutdown());
+        anyhow::ensure!(
+            tokio::time::timeout(HELD, &mut shutdown).await.is_err(),
+            "ACCEPTED_FATAL_OWNERSHIP: early API completion detached the retained reader"
+        );
+        old.release();
+        within(&mut shutdown, "accepted-client fatal cleanup after reader release").await??;
         anyhow::ensure!(*old.dropped.borrow());
         let metrics = fixture.raft.metrics().borrow().clone();
         anyhow::ensure!(
@@ -1473,6 +1684,39 @@ async fn install_waits_for_retired_snapshot_child_after_cancellation() -> Result
             "RETIRED_SNAPSHOT_JOIN: install returned before snapshot data dropped"
         );
         Ok(())
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn retired_snapshot_local_storage_error_survives_closed_callback_channel() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let child = retired_snapshot(&fixture).await?;
+        // Parent retirement has closed the core-to-parent channel and the child
+        // has observed cancellation, but it still owns the actual snapshot data.
+        child.storage_error_on_release.store(true, Ordering::SeqCst);
+        let mut shutdown = std::pin::pin!(fixture.raft.shutdown());
+        anyhow::ensure!(
+            tokio::time::timeout(HELD, &mut shutdown).await.is_err(),
+            "RETIRED_SNAPSHOT_STORAGE_OWNERSHIP: shutdown detached the snapshot child"
+        );
+        anyhow::ensure!(!*child.dropped.borrow());
+        anyhow::ensure!(fixture.raft.metrics().borrow().state != ServerState::Shutdown);
+        child.release.close();
+        within(&mut shutdown, "snapshot storage-failure cleanup").await??;
+        anyhow::ensure!(*child.dropped.borrow());
+        let metrics = fixture.raft.metrics().borrow().clone();
+        anyhow::ensure!(metrics.state == ServerState::Shutdown);
+        anyhow::ensure!(
+            matches!(metrics.running_state, Err(Fatal::StorageError(ref error)) if error.to_string().contains(STREAMED_SNAPSHOT_FAULT)),
+            "RETIRED_SNAPSHOT_STORAGE_CAUSE: closed callback channel discarded local storage failure: {:?}",
+            metrics.running_state
+        );
+        fixture.assert_quiet().await
     }
     .await;
     let cleanup = fixture.stop().await;
@@ -1746,5 +1990,399 @@ async fn snapshot_callback_does_not_release_child_ownership_before_join_completi
     result?;
     leader??;
     follower??;
+    Ok(())
+}
+
+async fn finish_reader_fatal(fixture: &Fixture, old: &ReadGate, error: &StorageError<u64>, marker: &str) -> Result<()> {
+    let metrics = fixture.raft.metrics().borrow().clone();
+    anyhow::ensure!(
+        metrics.state != ServerState::Shutdown
+            && metrics.running_state == Err(Fatal::StorageError(error.clone()))
+            && !*old.dropped.borrow(),
+        "{marker}: API completion lost the original fatal or claimed joined cleanup"
+    );
+    let mut shutdown = std::pin::pin!(fixture.raft.shutdown());
+    anyhow::ensure!(
+        tokio::time::timeout(HELD, &mut shutdown).await.is_err(),
+        "{marker}: shutdown detached the retained reader"
+    );
+    old.release();
+    within(&mut shutdown, marker).await??;
+    anyhow::ensure!(*old.dropped.borrow() && fixture.probe.live_readers.lock().unwrap().is_empty());
+    let metrics = fixture.raft.metrics().borrow().clone();
+    anyhow::ensure!(
+        metrics.state == ServerState::Shutdown && metrics.running_state == Err(Fatal::StorageError(error.clone())),
+        "{marker}: joined cleanup replaced the original fatal"
+    );
+    Ok(())
+}
+
+async fn reported_storage_failure(fixture: &Fixture, marker: &str) -> Result<StorageError<u64>> {
+    let mut metrics = fixture.raft.metrics();
+    let failure = within(metrics.wait_for(|value| value.running_state.is_err()), marker).await??.running_state.clone();
+    match failure {
+        Err(Fatal::StorageError(error)) => Ok(error),
+        other => anyhow::bail!("{marker}: expected typed storage failure, received {other:?}"),
+    }
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn queued_calls_complete_when_a_held_append_fails_before_retirement_finishes() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let old = fixture.retired_reader().await?;
+        let persisted = fixture.store.clone().get_log_state().await?.last_log_id;
+        let append_gate = fixture.probe.arm_append();
+        fixture.probe.fail_append.store(true, Ordering::SeqCst);
+        let mut write = std::pin::pin!(fixture.raft.client_write(ClientRequest::make_request("queued-fatal", 1)));
+        anyhow::ensure!(futures::poll!(&mut write).is_pending());
+        observed(&append_gate.entered, "QUEUED_FATAL_SETUP: actual append was not held").await?;
+        anyhow::ensure!(fixture.raft.metrics().borrow().running_state.is_ok());
+
+        // Poll through each public send while the core is still inside append.
+        // The pending receivers are already enqueued, before any fatal is visible.
+        let mut snapshot = std::pin::pin!(fixture.raft.get_snapshot());
+        anyhow::ensure!(futures::poll!(&mut snapshot).is_pending());
+        let inspected = Arc::new(AtomicBool::new(false));
+        let called = inspected.clone();
+        let mut state = std::pin::pin!(fixture.raft.with_raft_state(move |_| called.store(true, Ordering::SeqCst)));
+        anyhow::ensure!(futures::poll!(&mut state).is_pending());
+        anyhow::ensure!(
+            fixture.raft.metrics().borrow().running_state.is_ok()
+                && !inspected.load(Ordering::SeqCst)
+                && !*fixture.probe.failed_append.borrow(),
+            "QUEUED_FATAL_SETUP: the second requests were not queued before failure"
+        );
+        append_gate.release.close();
+        observed(
+            &fixture.probe.failed_append,
+            "QUEUED_FATAL_SETUP: held append did not actually fail",
+        )
+        .await?;
+        let error = reported_storage_failure(&fixture, "QUEUED_FATAL_SETUP: append cause was not published").await?;
+        anyhow::ensure!(error.to_string().contains(FAULT));
+        let response = within(
+            &mut snapshot,
+            "QUEUED_FATAL_SNAPSHOT_COMPLETION: queued caller waited for retirement",
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(response, Err(RaftError::Fatal(Fatal::StorageError(ref actual))) if actual == &error),
+            "QUEUED_FATAL_SNAPSHOT_COMPLETION: queued caller lost original append failure: {response:?}"
+        );
+        let response = within(
+            &mut state,
+            "QUEUED_FATAL_STATE_COMPLETION: queued state inspection waited for retirement",
+        )
+        .await?;
+        anyhow::ensure!(
+            response == Err(Fatal::StorageError(error.clone())) && !inspected.load(Ordering::SeqCst),
+            "QUEUED_FATAL_STATE_COMPLETION: queued state inspection ran after failure or lost its cause: {response:?}"
+        );
+        let response = within(
+            &mut write,
+            "QUEUED_FATAL_WRITE_COMPLETION: indexed caller waited for retirement",
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(response, Err(RaftError::Fatal(Fatal::StorageError(ref actual))) if actual == &error),
+            "QUEUED_FATAL_WRITE_COMPLETION: indexed caller lost original append failure: {response:?}"
+        );
+        anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_log_id == persisted);
+        finish_reader_fatal(&fixture, &old, &error, "QUEUED_FATAL_READER_OWNERSHIP").await
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn deferred_append_response_reports_failed_persistence_before_retirement_finishes() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let old = fixture.retired_reader().await?;
+        let previous = fixture.store.clone().get_log_state().await?.last_log_id.unwrap();
+        let persisted_vote = fixture.store.clone().read_vote().await?;
+        let vote = Vote::new_committed(fixture.raft.metrics().borrow().current_term + 1, 1);
+        let vote_gate = WorkGate::new();
+        fixture.probe.work_gates.lock().unwrap().push(vote_gate.clone());
+        *fixture.probe.armed_vote_failure.lock().unwrap() = Some(vote_gate.clone());
+        // This valid higher-term heartbeat queues SaveVote before QuitLeader
+        // and Command::Respond. Failing actual vote persistence therefore leaves
+        // the engine-owned response pending while fatal cleanup retains readers.
+        let mut response = std::pin::pin!(fixture.raft.append_entries(AppendEntriesRequest {
+            vote,
+            prev_log_id: Some(previous),
+            entries: vec![],
+            leader_commit: Some(previous),
+        }));
+        anyhow::ensure!(futures::poll!(&mut response).is_pending());
+        observed(
+            &vote_gate.entered,
+            "DEFERRED_RESPOND_SETUP: higher-term append did not reach vote persistence",
+        )
+        .await?;
+        let persisted = fixture.store.clone().get_log_state().await?.last_log_id;
+        anyhow::ensure!(
+            futures::poll!(&mut response).is_pending()
+                && !*old.dropped.borrow()
+                && fixture.store.clone().read_vote().await? == persisted_vote
+                && persisted == Some(previous),
+            "DEFERRED_RESPOND_DURABILITY: success was exposed before persistence"
+        );
+        vote_gate.release.close();
+        observed(
+            &fixture.probe.failed_vote,
+            "DEFERRED_RESPOND_SETUP: persistence did not actually fail",
+        )
+        .await?;
+        let error = match within(
+            &mut response,
+            "DEFERRED_RESPOND_FATAL_COMPLETION: engine response waited for retirement",
+        )
+        .await?
+        {
+            Err(RaftError::Fatal(Fatal::StorageError(error))) => error,
+            other => anyhow::bail!(
+                "DEFERRED_RESPOND_FATAL_COMPLETION: engine returned success or lost original failure: {other:?}"
+            ),
+        };
+        anyhow::ensure!(error.to_string().contains(VOTE_FAULT));
+        anyhow::ensure!(fixture.store.clone().read_vote().await? == persisted_vote);
+        anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_log_id == Some(previous));
+        anyhow::ensure!(fixture.store.get_state_machine().await.last_applied_log == Some(previous));
+        anyhow::ensure!(fixture.probe.operations().is_empty());
+        finish_reader_fatal(&fixture, &old, &error, "DEFERRED_RESPOND_READER_OWNERSHIP").await
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn sm_owned_snapshot_call_observes_independent_fatal_without_cancelling_storage() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let old = fixture.retired_reader().await?;
+        fixture.snapshot().await?;
+        let read = fixture.probe.arm_snapshot_read();
+        let mut snapshot = std::pin::pin!(fixture.raft.get_snapshot());
+        anyhow::ensure!(futures::poll!(&mut snapshot).is_pending());
+        observed(
+            &read.entered,
+            "SM_OWNED_FATAL_SETUP: actual snapshot read did not retain its result",
+        )
+        .await?;
+        anyhow::ensure!(!*read.finished.borrow() && fixture.raft.metrics().borrow().running_state.is_ok());
+
+        // The state and log adapters are independent. The SM worker retains this
+        // snapshot responder and storage future while an actual log append fails.
+        let append_gate = fixture.probe.arm_append();
+        fixture.probe.fail_append.store(true, Ordering::SeqCst);
+        let mut write = std::pin::pin!(fixture.raft.client_write(ClientRequest::make_request("sm-owned-fatal", 1)));
+        anyhow::ensure!(futures::poll!(&mut write).is_pending());
+        observed(
+            &append_gate.entered,
+            "SM_OWNED_FATAL_SETUP: independent append did not reach storage",
+        )
+        .await?;
+        append_gate.release.close();
+        observed(
+            &fixture.probe.failed_append,
+            "SM_OWNED_FATAL_SETUP: independent append did not fail",
+        )
+        .await?;
+        let error =
+            reported_storage_failure(&fixture, "SM_OWNED_FATAL_SETUP: independent fatal was not published").await?;
+        anyhow::ensure!(*fixture.probe.failed_append.borrow() && error.to_string().contains(FAULT));
+        let response = within(
+            &mut snapshot,
+            "SM_OWNED_FATAL_API_COMPLETION: SM-owned responder hid original fatal",
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(response, Err(RaftError::Fatal(Fatal::StorageError(ref actual))) if actual == &error),
+            "SM_OWNED_FATAL_API_COMPLETION: SM-owned API lost the independent fatal: {response:?}"
+        );
+        anyhow::ensure!(
+            !*read.finished.borrow() && !read.release.is_closed() && !*old.dropped.borrow(),
+            "SM_OWNED_FATAL_STORAGE_OWNERSHIP: returning the fatal cancelled actual storage or retired reader"
+        );
+        let response = within(
+            &mut write,
+            "SM_OWNED_FATAL_WRITE_COMPLETION: append caller waited for retained storage",
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(response, Err(RaftError::Fatal(Fatal::StorageError(ref actual))) if actual == &error),
+            "SM_OWNED_FATAL_WRITE_COMPLETION: append caller lost original failure: {response:?}"
+        );
+        read.release.close();
+        observed(
+            &read.finished,
+            "SM_OWNED_FATAL_STORAGE_RELEASE: actual storage did not finish after release",
+        )
+        .await?;
+        finish_reader_fatal(&fixture, &old, &error, "SM_OWNED_FATAL_READER_OWNERSHIP").await
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+async fn returned_snapshot_storage_error(child: &SnapshotGate, marker: &str) -> Result<StorageError<u64>> {
+    let mut observed = child.returned_storage_error.subscribe();
+    let value = within(observed.wait_for(Option::is_some), marker).await??;
+    Ok(value.as_ref().unwrap().clone())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn idle_core_stops_after_retired_snapshot_child_returns_local_storage_error() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let child = retired_snapshot(&fixture).await?;
+        child.storage_error_on_release.store(true, Ordering::SeqCst);
+        anyhow::ensure!(
+            *child.cancelled.borrow()
+                && !*child.dropped.borrow()
+                && fixture.raft.metrics().borrow().running_state.is_ok()
+        );
+        child.release.close();
+        let error =
+            returned_snapshot_storage_error(&child, "IDLE_SNAPSHOT_STORAGE_SETUP: child did not return local error")
+                .await?;
+        anyhow::ensure!(error.to_string().contains(STREAMED_SNAPSHOT_FAULT));
+        // Observe only: no shutdown, write, trigger or core callback is sent to
+        // make the idle retirement/error path run.
+        let mut metrics = fixture.raft.metrics();
+        let stopped = within(
+            metrics.wait_for(|value| value.state == ServerState::Shutdown),
+            "IDLE_SNAPSHOT_STORAGE_FATAL: local error did not stop the otherwise live core",
+        )
+        .await??
+        .clone();
+        anyhow::ensure!(
+            stopped.running_state == Err(Fatal::StorageError(error)),
+            "IDLE_SNAPSHOT_STORAGE_CAUSE: autonomous termination lost the exact child storage error: {:?}",
+            stopped.running_state
+        );
+        anyhow::ensure!(*child.dropped.borrow() && fixture.probe.live_readers.lock().unwrap().is_empty());
+        Ok(())
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn earlier_append_fatal_survives_retired_snapshot_local_storage_error() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let child = retired_snapshot(&fixture).await?;
+        child.storage_error_on_release.store(true, Ordering::SeqCst);
+        fixture.probe.fail_append.store(true, Ordering::SeqCst);
+        let error = match within(
+            fixture.raft.client_write(ClientRequest::make_request("primary-fatal", 1)),
+            "PRIMARY_FATAL_SNAPSHOT_COMPLETION: original append failure waited for snapshot cleanup",
+        )
+        .await?
+        {
+            Err(RaftError::Fatal(Fatal::StorageError(error))) => error,
+            other => anyhow::bail!("PRIMARY_FATAL_SNAPSHOT_COMPLETION: original append failure was lost: {other:?}"),
+        };
+        anyhow::ensure!(*fixture.probe.failed_append.borrow() && error.to_string().contains(FAULT));
+        anyhow::ensure!(
+            fixture.raft.metrics().borrow().running_state == Err(Fatal::StorageError(error.clone()))
+                && !*child.dropped.borrow()
+        );
+        let mut shutdown = std::pin::pin!(fixture.raft.shutdown());
+        anyhow::ensure!(
+            tokio::time::timeout(HELD, &mut shutdown).await.is_err(),
+            "PRIMARY_FATAL_SNAPSHOT_OWNERSHIP: original fatal detached the child"
+        );
+        child.release.close();
+        let secondary =
+            returned_snapshot_storage_error(&child, "PRIMARY_FATAL_SNAPSHOT_SETUP: child error was not returned")
+                .await?;
+        anyhow::ensure!(secondary != error && secondary.to_string().contains(STREAMED_SNAPSHOT_FAULT));
+        within(
+            &mut shutdown,
+            "PRIMARY_FATAL_SNAPSHOT_JOIN: cleanup failed after child error",
+        )
+        .await??;
+        let metrics = fixture.raft.metrics().borrow().clone();
+        anyhow::ensure!(
+            metrics.state == ServerState::Shutdown && metrics.running_state == Err(Fatal::StorageError(error)),
+            "PRIMARY_FATAL_SNAPSHOT_PRECEDENCE: secondary child storage failure replaced original append failure"
+        );
+        anyhow::ensure!(*child.dropped.borrow() && fixture.probe.live_readers.lock().unwrap().is_empty());
+        Ok(())
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn retired_snapshot_cancellation_network_and_remote_errors_remain_nonfatal() -> Result<()> {
+    for outcome in [
+        None,
+        Some(NonfatalSnapshotError::Network),
+        Some(NonfatalSnapshotError::RemoteStorage),
+    ] {
+        let fixture = Fixture::new().await?;
+        let result = async {
+            let child = retired_snapshot(&fixture).await?;
+            *child.nonfatal_on_release.lock().unwrap() = outcome;
+            // A physical purge cannot cross the retired child. Its completion is
+            // a public storage barrier proving the retirement pool joined this outcome.
+            let target = fixture.snapshot().await?.meta.last_log_id.unwrap();
+            within(
+                fixture.raft.trigger().purge_log(target.index),
+                "NONFATAL_SNAPSHOT_SETUP: schedule join barrier",
+            )
+            .await??;
+            within(
+                fixture.raft.with_raft_state(|_| ()),
+                "NONFATAL_SNAPSHOT_SETUP: accept join barrier",
+            )
+            .await??;
+            anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_purged_log_id < Some(target));
+            anyhow::ensure!(*child.cancelled.borrow() && !*child.dropped.borrow());
+            child.release.close();
+            within(
+                fixture.raft.wait(None).purged(Some(target), "nonfatal retired child joined"),
+                "RETIRED_SNAPSHOT_NONFATAL_JOIN: nonlocal outcome incorrectly prevented live-core purge",
+            )
+            .await?
+            .context("RETIRED_SNAPSHOT_NONFATAL_JOIN: core failed before the retirement barrier completed")?;
+            anyhow::ensure!(*child.dropped.borrow() && child.returned_storage_error.borrow().is_none());
+            fixture.probe.assert_no_overlap()?;
+            let response = within(
+                fixture.raft.client_write(ClientRequest::make_request("nonfatal-retirement", 1)),
+                "RETIRED_SNAPSHOT_NONFATAL_PROGRESS: joined nonlocal outcome stopped writes",
+            )
+            .await??;
+            fixture.caught_up(&[1, 2], response.log_id).await?;
+            anyhow::ensure!(
+                fixture.raft.metrics().borrow().running_state.is_ok(),
+                "RETIRED_SNAPSHOT_NONFATAL_OUTCOME: cancellation/network/remote error became a local fatal"
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let cleanup = fixture.stop().await;
+        result.with_context(|| format!("retired snapshot outcome {outcome:?}"))?;
+        cleanup?;
+        anyhow::ensure!(
+            fixture.raft.metrics().borrow().running_state == Err(Fatal::Stopped),
+            "RETIRED_SNAPSHOT_NONFATAL_OUTCOME: normal shutdown retained a false fatal for {outcome:?}"
+        );
+    }
     Ok(())
 }

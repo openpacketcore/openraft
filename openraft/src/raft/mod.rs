@@ -880,16 +880,7 @@ where C: RaftTypeConfig
             }
         });
 
-        match rx.await {
-            Ok(res) => Ok(res),
-            Err(err) => {
-                tracing::error!(error = display(&err), "{}: rx recv error", func_name!());
-
-                let when = format!("{}: rx recv", func_name!());
-                let fatal = self.inner.get_core_stopped_error(when, None::<u64>).await;
-                Err(fatal)
-            }
-        }
+        self.inner.recv_msg(rx).await
     }
 
     /// Send a request to the Raft core loop in a fire-and-forget manner.

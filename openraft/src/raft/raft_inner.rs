@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
-use tracing::Level;
 
 use crate::config::RuntimeConfig;
 use crate::core::raft_msg::external_command::ExternalCommand;
@@ -62,6 +61,7 @@ where C: RaftTypeConfig
 {
     /// Send a RaftMsg to RaftCore
     pub(crate) async fn send_msg(&self, mes: RaftMsg<C>) -> Result<(), Fatal<C::NodeId>> {
+        self.rx_metrics.borrow().running_state.clone()?;
         let send_res = self.tx_api.send(mes);
 
         if let Err(e) = send_res {
@@ -77,7 +77,16 @@ where C: RaftTypeConfig
         T: OptionalSend,
         E: OptionalSend,
     {
-        let recv_res = rx.await;
+        // Prefer a response already delivered before the failure. Otherwise the
+        // fatal signal must release callers even when another task still owns
+        // their responder and replication cleanup is waiting for a reader.
+        let recv_res = tokio::select! {
+            biased;
+            result = rx => result,
+            _ = self.observe_core_failure() => {
+                return Err(self.get_core_stopped_error("core failed while awaiting response", None::<u64>).await);
+            }
+        };
         tracing::debug!("{} receives result is error: {:?}", func_name!(), recv_res.is_err());
 
         match recv_res {
@@ -102,25 +111,8 @@ where C: RaftTypeConfig
         E: Debug + OptionalSend,
         T: OptionalSend,
     {
-        let sum = if tracing::enabled!(Level::DEBUG) {
-            Some(mes.summary())
-        } else {
-            None
-        };
-
         self.send_msg(mes).await?;
-
-        let recv_res = rx.await;
-        tracing::debug!("call_core receives result is error: {:?}", recv_res.is_err());
-
-        match recv_res {
-            Ok(x) => x.map_err(|e| RaftError::APIError(e)),
-            Err(_) => {
-                let fatal = self.get_core_stopped_error_bounded("receiving rx from RaftCore", sum).await;
-                tracing::error!(error = debug(&fatal), "core_call fatal error");
-                Err(RaftError::Fatal(fatal))
-            }
-        }
+        self.recv_msg(rx).await?.map_err(RaftError::APIError)
     }
 
     /// Send an [`ExternalCommand`] to RaftCore to execute in the `RaftCore` thread.
@@ -131,6 +123,7 @@ where C: RaftTypeConfig
         cmd: ExternalCommand<C>,
         cmd_desc: impl fmt::Display + Default,
     ) -> Result<(), Fatal<C::NodeId>> {
+        self.rx_metrics.borrow().running_state.clone()?;
         let send_res = self.tx_api.send(RaftMsg::ExternalCommand { cmd });
 
         if send_res.is_err() {
@@ -174,23 +167,21 @@ where C: RaftTypeConfig
     /// Returns `true` if a failure was observed, `false` if the core is still running after
     /// `timeout`.
     async fn wait_core_failure(&self, timeout: Duration) -> bool {
+        C::AsyncRuntime::timeout(timeout, self.observe_core_failure()).await.is_ok()
+    }
+
+    /// Observe a failure without requiring the response owner or core task to return.
+    async fn observe_core_failure(&self) {
         let mut rx = self.rx_metrics.clone();
-
-        let observe = async move {
-            loop {
-                if rx.borrow().running_state.is_err() {
-                    return;
-                }
-
-                // `changed()` returns an error only when the metrics sender is dropped,
-                // i.e. the RaftCore task has ended.
-                if rx.changed().await.is_err() {
-                    return;
-                }
+        loop {
+            if rx.borrow().running_state.is_err() {
+                return;
             }
-        };
-
-        C::AsyncRuntime::timeout(timeout, observe).await.is_ok()
+            // A dropped metrics sender also means the core task has ended.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Get the error that caused RaftCore to stop.

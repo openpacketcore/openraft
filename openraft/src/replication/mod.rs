@@ -36,6 +36,7 @@ use crate::error::PayloadTooLarge;
 use crate::error::RPCError;
 use crate::error::ReplicationClosed;
 use crate::error::ReplicationError;
+use crate::error::StreamingError;
 use crate::error::Timeout;
 use crate::log_id::LogIdOptionExt;
 use crate::log_id_range::LogIdRange;
@@ -814,7 +815,7 @@ where
         );
         let notify = self.tx_raft_core.clone();
         let jh = C::spawn(async move {
-            let result = AssertUnwindSafe(send).catch_unwind().await.map_err(|_| Fatal::Panicked);
+            let result = AssertUnwindSafe(send).catch_unwind().await.unwrap_or(Err(Fatal::Panicked));
             if let Err(error) = &result {
                 let _ = notify.send(Notify::ReplicationFatal { error: error.clone() });
             }
@@ -833,7 +834,7 @@ where
         option: RPCOption,
         cancel: oneshot::Receiver<()>,
         weak_tx: mpsc::WeakUnboundedSender<Replicate<C>>,
-    ) {
+    ) -> Result<(), Fatal<C::NodeId>> {
         let meta = snapshot.meta.clone();
 
         let mut net = network.lock().await;
@@ -850,6 +851,13 @@ where
             tracing::warn!(error = display(e), "failed to send snapshot");
         }
 
+        // A retired parent may no longer receive its weak callback. Preserve a
+        // local storage failure in the owned task result as well, so cancellation
+        // and callback loss cannot turn it into a successful join.
+        let fatal = match &res {
+            Err(StreamingError::StorageError(error)) => Some(Fatal::StorageError(error.clone())),
+            _ => None,
+        };
         let res = res.decompose_infallible();
 
         if let Some(tx_noty) = weak_tx.upgrade() {
@@ -860,6 +868,10 @@ where
             }
         } else {
             tracing::warn!("weak_tx is dropped, no response is sent to ReplicationCore");
+        }
+        match fatal {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 

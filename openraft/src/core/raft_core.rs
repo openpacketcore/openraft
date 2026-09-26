@@ -245,6 +245,10 @@ where
         let mut metrics = self.tx_metrics.borrow().clone();
         metrics.running_state = Err(err.clone());
         let _ = self.tx_metrics.send(metrics);
+        // No further request can be processed while cleanup owns this task.
+        // Existing responders can remain owned elsewhere; their callers also
+        // observe the fatal metrics signal instead of waiting for those owners.
+        self.rx_api.close();
 
         // No Shutdown metric or successful shutdown may outlive replication storage access.
         // Drain all generations even if one fails, preserving the original fatal cause.

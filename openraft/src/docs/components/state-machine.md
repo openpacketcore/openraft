@@ -88,9 +88,13 @@ Membership rebuild retires old replication tasks without waiting for their I/O.
 The core owns all generations until their log readers and snapshot children have
 returned. Leadership changes join those owners before destructive storage work;
 normal and fatal shutdown join them before reporting the Shutdown state. A fatal
-cause is published before cleanup so API callers can receive the original error
-without waiting for retained readers. Cancellation requests a snapshot task to
-stop; only its completed join establishes that its data has been released.
+cause is published before cleanup. New and already waiting API calls observe that
+failure without waiting for retained readers or responder owners, while a reply
+already delivered remains usable. Application-defined receivers returned by
+`client_write_ff` retain their own completion contract. Cancellation requests a
+snapshot task to stop; only its completed join establishes that its data has been released. A local
+snapshot storage error remains in the owned task result even when retirement has
+closed its callback channel.
 
 This option applies to runtime application. Startup recovery continues to use
 its existing 64-entry chunks through `try_get_log_entries`, independently of

@@ -19,7 +19,6 @@ use crate::engine::EngineConfig;
 use crate::engine::LogIdList;
 use crate::raft::VoteRequest;
 use crate::testing::log_id;
-use crate::utime::UTime;
 use crate::AsyncRuntime;
 use crate::CommittedLeaderId;
 use crate::Config;
@@ -28,7 +27,6 @@ use crate::LogId;
 use crate::Membership;
 use crate::OptionalSend;
 use crate::RaftTypeConfig;
-use crate::TokioInstant;
 use crate::TokioRuntime;
 use crate::Vote;
 
