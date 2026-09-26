@@ -1,8 +1,8 @@
 use openraft_macros::add_async_trait;
 
 use crate::engine::Command;
+use crate::error::Fatal;
 use crate::RaftTypeConfig;
-use crate::StorageError;
 
 /// Defines behaviors of a runtime to support the protocol engine.
 ///
@@ -62,5 +62,5 @@ pub(crate) trait RaftRuntime<C: RaftTypeConfig> {
     /// Run a command produced by the engine.
     ///
     /// If a command can not be run, i.e., waiting for some event, it will be returned
-    async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, StorageError<C::NodeId>>;
+    async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, Fatal<C::NodeId>>;
 }

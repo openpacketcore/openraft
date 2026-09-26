@@ -227,6 +227,14 @@ where C: RaftTypeConfig
         // A campaign consumes the timeout selected for it. Select a new timeout
         // for the next campaign so repeated split votes do not remain in lockstep.
         self.config.resample_election_timeout::<C::AsyncRuntime>();
+        // Leadership must be relinquished before campaigning: a Leader that campaigns keeps
+        // `leader.vote` at the old term while `state.vote` moves to the new one, which breaks the
+        // invariant `LeaderHandler` relies on.
+        debug_assert!(
+            self.leader.is_none(),
+            "elect() requires leadership to be relinquished: leader.vote({})",
+            self.leader.as_ref().map(|l| l.vote.to_string()).unwrap_or_default()
+        );
 
         let new_term = self.state.vote.leader_id().term + 1;
         let new_vote = Vote::new(new_term, self.config.id.clone());

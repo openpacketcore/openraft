@@ -142,6 +142,18 @@ pub struct MemStore {
 
     /// The current snapshot.
     current_snapshot: RwLock<Option<MemStoreSnapshot>>,
+
+    /// When set, [`begin_receiving_snapshot()`] panics, simulating the state machine worker task
+    /// dying while `RaftCore` keeps running.
+    ///
+    /// [`begin_receiving_snapshot()`]: openraft::RaftStorage::begin_receiving_snapshot
+    panic_on_begin_receiving_snapshot: AtomicBool,
+
+    /// When set, [`limited_get_log_entries()`] returns an empty result for a non-empty range,
+    /// simulating a store that violates the API contract.
+    ///
+    /// [`limited_get_log_entries()`]: openraft::RaftLogReader::limited_get_log_entries
+    return_empty_limited_get: AtomicBool,
 }
 
 impl MemStore {
@@ -161,6 +173,8 @@ impl MemStore {
             vote: RwLock::new(None),
             snapshot_idx: Arc::new(Mutex::new(0)),
             current_snapshot,
+            panic_on_begin_receiving_snapshot: AtomicBool::new(false),
+            return_empty_limited_get: AtomicBool::new(false),
         }
     }
 
@@ -185,6 +199,22 @@ impl MemStore {
     pub async fn clear_state_machine(&self) {
         let mut sm = self.sm.write().await;
         *sm = MemStoreStateMachine::default();
+    }
+
+    /// Arm the state machine to panic the next time it begins receiving a snapshot, simulating a
+    /// crash of the state machine worker task while `RaftCore` keeps running.
+    ///
+    /// This method is only used for testing purposes.
+    pub fn set_panic_on_begin_receiving_snapshot(&self, panic: bool) {
+        self.panic_on_begin_receiving_snapshot.store(panic, Ordering::Relaxed);
+    }
+
+    /// Make `limited_get_log_entries()` return an empty result for a non-empty range, simulating
+    /// a store that violates the API contract.
+    ///
+    /// This method is only used for testing purposes.
+    pub fn set_return_empty_limited_get(&self, value: bool) {
+        self.return_empty_limited_get.store(value, Ordering::Relaxed);
     }
 
     /// Block an operation for testing purposes.
@@ -224,6 +254,18 @@ impl RaftLogReader<TypeConfig> for Arc<MemStore> {
         };
 
         Ok(entries)
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<MemNodeId>> {
+        if self.return_empty_limited_get.load(Ordering::Relaxed) {
+            return Ok(vec![]);
+        }
+
+        self.try_get_log_entries(start..end).await
     }
 }
 
@@ -455,6 +497,10 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<MemNodeId>> {
+        if self.panic_on_begin_receiving_snapshot.load(Ordering::Relaxed) {
+            panic!("injected state machine worker panic in begin_receiving_snapshot");
+        }
+
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 

@@ -7,6 +7,7 @@ pub(crate) mod request;
 pub(crate) mod request_id;
 pub(crate) mod response;
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use crate::core::notify::Notify;
 use crate::core::sm::handle::SnapshotReader;
 use crate::display_ext::DisplayOptionExt;
 use crate::error::decompose::DecomposeResult;
+use crate::error::Fatal;
 use crate::error::HigherVote;
 use crate::error::PayloadTooLarge;
 use crate::error::RPCError;
@@ -68,7 +70,7 @@ pub(crate) struct ReplicationHandle<C>
 where C: RaftTypeConfig
 {
     /// The spawn handle the `ReplicationCore` task.
-    pub(crate) join_handle: JoinHandleOf<C, Result<(), ReplicationClosed>>,
+    pub(crate) join_handle: JoinHandleOf<C, Result<(), Fatal<C::NodeId>>>,
 
     /// The channel used for communicating with the replication task.
     pub(crate) tx_repl: mpsc::UnboundedSender<Replicate<C>>,
@@ -116,9 +118,10 @@ where
     /// The current snapshot replication state.
     ///
     /// It includes a cancel signaler and the join handle of the snapshot replication task.
-    /// When ReplicationCore is dropped, this Sender is dropped, the snapshot task will be notified
-    /// to quit.
-    snapshot_state: Option<(oneshot::Sender<()>, JoinHandleOf<C, ()>)>,
+    /// The parent cancels and joins this task before returning, including on failure.
+    /// Dropping the cancellation sender alone does not establish completion.
+    #[allow(clippy::type_complexity)]
+    snapshot_state: Option<(oneshot::Sender<()>, JoinHandleOf<C, Result<(), Fatal<C::NodeId>>>)>,
 
     /// The backoff policy if an [`Unreachable`](`crate::error::Unreachable`) error is returned.
     /// It will be reset to `None` when an successful response is received.
@@ -209,12 +212,31 @@ where
     }
 
     #[tracing::instrument(level="debug", skip(self), fields(session=%self.session_id, target=display(&self.target), cluster=%self.config.cluster_name))]
-    async fn main(mut self) -> Result<(), ReplicationClosed> {
+    async fn main(mut self) -> Result<(), Fatal<C::NodeId>> {
+        // Catch only to perform owned cleanup. No protocol work resumes after a panic.
+        let result = AssertUnwindSafe(self.main_loop()).catch_unwind().await.unwrap_or(Err(Fatal::Panicked));
+        if let Err(error) = &result {
+            let notification = match error {
+                Fatal::StorageError(error) => Notify::Network {
+                    response: Response::StorageError { error: error.clone() },
+                },
+                _ => Notify::ReplicationFatal { error: error.clone() },
+            };
+            let _ = self.tx_raft_core.send(notification);
+        }
+        let child_result = self.join_snapshot().await;
+        result.and(child_result)
+    }
+
+    async fn main_loop(&mut self) -> Result<(), Fatal<C::NodeId>> {
         loop {
             let action = self.next_action.take();
 
             let Some(d) = action else {
-                self.drain_events_with_backoff().await?;
+                if let Err(closed) = self.drain_events_with_backoff().await {
+                    tracing::debug!(%closed, "replication closed");
+                    return Ok(());
+                }
                 continue;
             };
 
@@ -238,8 +260,16 @@ where
                     log_data = Some(log.clone());
                     self.send_log_entries(log).await
                 }
-                Data::Snapshot(snap) => self.stream_snapshot(snap).await,
-                Data::SnapshotCallback(resp) => self.handle_snapshot_callback(resp),
+                Data::Snapshot(snap) => {
+                    // Never replace an owned child's handle before it has completed.
+                    self.join_snapshot().await?;
+                    self.stream_snapshot(snap).await
+                }
+                Data::SnapshotCallback(resp) => {
+                    // The callback is sent before the child returns. Join the tail too.
+                    self.join_snapshot().await?;
+                    self.handle_snapshot_callback(resp)
+                }
             };
 
             tracing::debug!(res = debug(&res), "replication action done");
@@ -259,12 +289,13 @@ where
 
                     match err {
                         ReplicationError::Closed(closed) => {
-                            return Err(closed);
+                            tracing::debug!(%closed, "replication closed");
+                            return Ok(());
                         }
                         ReplicationError::HigherVote(h) => {
                             let _ = self.tx_raft_core.send(Notify::Network {
                                 response: Response::HigherVote {
-                                    target: self.target,
+                                    target: self.target.clone(),
                                     higher: h.higher,
                                     sender_vote: self.session_id.vote_ref().clone(),
                                 },
@@ -274,11 +305,9 @@ where
                         ReplicationError::StorageError(error) => {
                             tracing::error!(error=%error, "error replication to target={}", self.target);
 
-                            // TODO: report this error
-                            let _ = self.tx_raft_core.send(Notify::Network {
-                                response: Response::StorageError { error },
-                            });
-                            return Ok(());
+                            // Retain the error in the join outcome as well as notifying the core:
+                            // shutdown may already have stopped consuming notifications.
+                            return Err(Fatal::StorageError(error));
                         }
                         ReplicationError::RPCError(err) => {
                             tracing::error!(err = display(&err), "RPCError");
@@ -315,8 +344,26 @@ where
                 }
             };
 
-            self.drain_events_with_backoff().await?;
+            if let Err(closed) = self.drain_events_with_backoff().await {
+                tracing::debug!(%closed, "replication closed");
+                return Ok(());
+            }
         }
+    }
+
+    /// Cancellation requests termination; only the join proves that snapshot data is released.
+    async fn join_snapshot(&mut self) -> Result<(), Fatal<C::NodeId>> {
+        if let Some((cancel, handle)) = self.snapshot_state.take() {
+            drop(cancel);
+            match handle.await {
+                Ok(result) => result?,
+                Err(error) => {
+                    tracing::error!(%error, "snapshot replication task did not finish normally");
+                    return Err(Fatal::Panicked);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn drain_events_with_backoff(&mut self) -> Result<(), ReplicationClosed> {
@@ -396,21 +443,41 @@ where
                 // limited_get_log_entries will return logs smaller than the range [start, end).
                 let logs = self.log_reader.limited_get_log_entries(start, end).await?;
 
-                let first = logs.first().map(|x| x.get_log_id().clone()).unwrap();
-                let last = logs.last().map(|x| x.get_log_id().clone()).unwrap();
+                // Handle an empty result gracefully by treating it as a heartbeat.
+                // Returning nothing for a non-empty range violates the API contract, but a
+                // faulty store must not panic replication. Sleep briefly first: `log_id_range`
+                // does not advance when no logs are returned, so retrying at once would spin.
+                if logs.is_empty() {
+                    let sleep_duration = Duration::from_millis(10);
+                    tracing::warn!(
+                        "limited_get_log_entries({}, {}) returned empty; \
+                         this violates the API contract but is handled gracefully as a heartbeat. \
+                         Sleeping {:?} to avoid a tight loop.",
+                        start,
+                        end,
+                        sleep_duration
+                    );
+                    C::sleep(sleep_duration).await;
 
-                debug_assert!(
-                    !logs.is_empty() && logs.len() <= (end - start) as usize,
-                    "expect logs ⊆ [{}..{}) but got {} entries, first: {}, last: {}",
-                    start,
-                    end,
-                    logs.len(),
-                    first,
-                    last
-                );
+                    let r = LogIdRange::new(rng.prev.clone(), rng.prev.clone());
+                    (vec![], r)
+                } else {
+                    let first = logs.first().map(|x| x.get_log_id().clone()).unwrap();
+                    let last = logs.last().map(|x| x.get_log_id().clone()).unwrap();
 
-                let r = LogIdRange::new(rng.prev.clone(), Some(last));
-                (logs, r)
+                    debug_assert!(
+                        logs.len() <= (end - start) as usize,
+                        "expect logs ⊆ [{}..{}) but got {} entries, first: {}, last: {}",
+                        start,
+                        end,
+                        logs.len(),
+                        first,
+                        last
+                    );
+
+                    let r = LogIdRange::new(rng.prev.clone(), Some(last));
+                    (logs, r)
+                }
             }
         };
 
@@ -736,7 +803,7 @@ where
 
         let (tx_cancel, rx_cancel) = oneshot::channel();
 
-        let jh = C::spawn(Self::send_snapshot(
+        let send = Self::send_snapshot(
             request_id,
             self.snapshot_network.clone(),
             self.session_id.vote_ref().clone(),
@@ -744,12 +811,16 @@ where
             option,
             rx_cancel,
             self.weak_tx_event.clone(),
-        ));
+        );
+        let notify = self.tx_raft_core.clone();
+        let jh = C::spawn(async move {
+            let result = AssertUnwindSafe(send).catch_unwind().await.map_err(|_| Fatal::Panicked);
+            if let Err(error) = &result {
+                let _ = notify.send(Notify::ReplicationFatal { error: error.clone() });
+            }
+            result
+        });
 
-        // When self.rx_event is dropped:
-        // 1) ReplicationCore will return from the main loop;
-        // 2) and tx_cancel is dropped;
-        // 3) and the snapshot task will be notified.
         self.snapshot_state = Some((tx_cancel, jh));
         Ok(None)
     }
@@ -803,7 +874,10 @@ where
             "handle_snapshot_response"
         );
 
-        self.snapshot_state = None;
+        debug_assert!(
+            self.snapshot_state.is_none(),
+            "snapshot child must be joined before its callback"
+        );
 
         let request_id = callback.request_id();
         let SnapshotCallback {
@@ -840,8 +914,16 @@ where
         leader_time: InstantOf<C>,
         log_ids: DataWithId<LogIdRange<C::NodeId>>,
     ) -> Option<Data<C>> {
+        // An empty first-range read or a partial response can acknowledge the
+        // leader without matching any log. Report only its clock acknowledgement;
+        // keep the data request in flight and retry its original range below.
+        let progress_request_id = if matching.is_some() {
+            log_ids.request_id()
+        } else {
+            RequestId::new_heartbeat()
+        };
         self.send_progress(
-            log_ids.request_id(),
+            progress_request_id,
             ReplicationResult::new(leader_time, Ok(matching.clone())),
         );
 

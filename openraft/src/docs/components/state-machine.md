@@ -78,10 +78,19 @@ per existing state-machine, log-removal or explicit response-condition interval.
 Coalescing retains the first start, latest end and latest command sequence, and
 keeps the combined command after all of its persistence dependencies. This does
 not bound the number of independently requested state-machine operations.
-Snapshot installation, log purges, conflict truncations and unsatisfied response
-conditions retain their ordering barriers. Their waits return to the normal
-event loop so remaining pages can make progress.
-Existing replication-task joins remain in effect when leadership changes.
+Snapshot installation, conflict truncations and unsatisfied response conditions
+retain their ordering barriers. Their waits return to the normal event loop so
+remaining pages can make progress. Physical log purge waits for completed apply
+and every retired replication reader, while independent persistence and responses
+can proceed. Releasing either owner alone does not permit early deletion.
+
+Membership rebuild retires old replication tasks without waiting for their I/O.
+The core owns all generations until their log readers and snapshot children have
+returned. Leadership changes join those owners before destructive storage work;
+normal and fatal shutdown join them before reporting the Shutdown state. A fatal
+cause is published before cleanup so API callers can receive the original error
+without waiting for retained readers. Cancellation requests a snapshot task to
+stop; only its completed join establishes that its data has been released.
 
 This option applies to runtime application. Startup recovery continues to use
 its existing 64-entry chunks through `try_get_log_entries`, independently of

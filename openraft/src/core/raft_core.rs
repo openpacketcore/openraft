@@ -4,12 +4,14 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::marker::PhantomData;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyerror::AnyError;
 use futures::stream::FuturesUnordered;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryFutureExt;
 use maplit::btreeset;
@@ -89,6 +91,8 @@ use crate::storage::RaftLogReaderExt;
 use crate::storage::RaftLogStorage;
 use crate::storage::RaftStateMachine;
 use crate::type_config::alias::InstantOf;
+use crate::type_config::alias::JoinErrorOf;
+use crate::type_config::alias::JoinHandleOf;
 use crate::type_config::alias::ResponderOf;
 use crate::type_config::TypeConfigExt;
 use crate::AsyncRuntime;
@@ -187,6 +191,10 @@ where
     /// A mapping of node IDs the replication state of the target node.
     pub(crate) replications: BTreeMap<C::NodeId, ReplicationHandle<C>>,
 
+    /// Every removed generation remains owned until its readers and snapshot child finish.
+    /// Membership rebuild must not wait for these tasks; storage removal and shutdown must.
+    pub(crate) retired_replications: FuturesUnordered<JoinHandleOf<C, Result<(), Fatal<C::NodeId>>>>,
+
     pub(crate) leader_data: Option<LeaderData<C>>,
 
     #[allow(dead_code)]
@@ -224,13 +232,32 @@ where
         rx_shutdown: <C::AsyncRuntime as AsyncRuntime>::OneshotReceiver<()>,
     ) -> Result<Infallible, Fatal<C::NodeId>> {
         let span = tracing::span!(parent: &self.span, Level::DEBUG, "main");
-        let res = self.do_main(rx_shutdown).instrument(span).await;
+        let res = AssertUnwindSafe(self.do_main(rx_shutdown).instrument(span))
+            .catch_unwind()
+            .await
+            .unwrap_or(Err(Fatal::Panicked));
 
-        // Flush buffered metrics
+        // Report the cause immediately, so a dropped API reply does not lose a real
+        // failure while storage readers are still being joined. The server state
+        // remains unchanged until cleanup completes: an error is not a joined shutdown.
         self.report_metrics(None);
+        let mut err = res.unwrap_err();
+        let mut metrics = self.tx_metrics.borrow().clone();
+        metrics.running_state = Err(err.clone());
+        let _ = self.tx_metrics.send(metrics);
 
-        // Safe unwrap: res is Result<Infallible, _>
-        let err = res.unwrap_err();
+        // No Shutdown metric or successful shutdown may outlive replication storage access.
+        // Drain all generations even if one fails, preserving the original fatal cause.
+        self.remove_all_replication();
+        let cleanup = self.drain_retired_replications().await;
+        if let Err(cleanup_error) = cleanup {
+            if matches!(err, Fatal::Stopped) {
+                err = cleanup_error;
+            } else {
+                tracing::error!(%cleanup_error, "additional failure during replication cleanup");
+            }
+        }
+
         match err {
             Fatal::Stopped => { /* Normal quit */ }
             _ => {
@@ -662,6 +689,15 @@ where
         self.engine.snapshot_handler().trigger_snapshot();
     }
 
+    /// Return the current leader node ID based on the committed vote.
+    ///
+    /// In Openraft a leader does not have to be a voter: leadership is determined solely by a
+    /// committed vote, i.e. a vote granted by a quorum, following Paxos semantics. This method
+    /// therefore does not check voter or membership status.
+    ///
+    /// This situation arises when a membership change removes the leader from the voter set, or
+    /// from the membership entirely. The leader keeps operating and committing logs until it steps
+    /// down or a new leader is elected.
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn current_leader(&self) -> Option<C::NodeId> {
         tracing::debug!(
@@ -677,16 +713,7 @@ where
         }
 
         // Safe unwrap(): vote that is committed has to already have voted for some node.
-        let id = vote.leader_id().voted_for().unwrap();
-
-        // TODO: `is_voter()` is slow, maybe cache `current_leader`,
-        //       e.g., only update it when membership or vote changes
-        if self.engine.state.membership_state.effective().is_voter(&id) {
-            Some(id)
-        } else {
-            tracing::debug!("id={} is not a voter", id);
-            None
-        }
+        Some(vote.leader_id().voted_for().unwrap())
     }
 
     /// Retrieves the most recent timestamp that is acknowledged by a quorum.
@@ -872,28 +899,39 @@ where
         )
     }
 
-    /// Remove all replication.
+    /// Close all active generations without blocking membership changes on their I/O.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn remove_all_replication(&mut self) {
-        tracing::info!("remove all replication");
-
-        let nodes = std::mem::take(&mut self.replications);
-
-        tracing::debug!(
-            targets = debug(nodes.iter().map(|x| x.0.clone()).collect::<Vec<_>>()),
-            "remove all targets from replication_metrics"
-        );
-
-        for (target, s) in nodes {
-            let handle = s.join_handle;
-
-            // Drop sender to notify the task to shutdown
-            drop(s.tx_repl);
-
-            tracing::debug!("joining removed replication: {}", target);
-            let _x = handle.await;
-            tracing::info!("Done joining removed replication : {}", target);
+    pub fn remove_all_replication(&mut self) {
+        for (target, stream) in std::mem::take(&mut self.replications) {
+            tracing::debug!(%target, "retire replication");
+            // Close every sender before awaiting any task. A removed stream may still own
+            // a log read or a snapshot, even though its progress notifications are stale.
+            drop(stream.tx_repl);
+            self.retired_replications.push(stream.join_handle);
         }
+    }
+
+    fn replication_join_result(
+        result: Result<Result<(), Fatal<C::NodeId>>, JoinErrorOf<C>>,
+    ) -> Result<(), Fatal<C::NodeId>> {
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, "replication task did not finish normally");
+                Err(Fatal::Panicked)
+            }
+        }
+    }
+
+    /// Drain every generation, even when an earlier join fails.
+    async fn drain_retired_replications(&mut self) -> Result<(), Fatal<C::NodeId>> {
+        let mut error = None;
+        while let Some(result) = self.retired_replications.next().await {
+            if let Err(err) = Self::replication_join_result(result) {
+                error.get_or_insert(err);
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 
     /// Run as many commands as possible.
@@ -901,7 +939,7 @@ where
     /// A paged apply can defer a snapshot without deferring unrelated durable
     /// replication. Other ordering barriers still wait for the next callback.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) async fn run_engine_commands(&mut self) -> Result<(), StorageError<C::NodeId>> {
+    pub(crate) async fn run_engine_commands(&mut self) -> Result<(), Fatal<C::NodeId>> {
         self.drive_bounded_apply().await?;
         if tracing::enabled!(Level::DEBUG) {
             tracing::debug!("queued commands: start...");
@@ -912,10 +950,11 @@ where
         }
 
         let mut index = 0;
+        let mut deferred_snapshot = false;
         while index < self.engine.output.commands.len() {
             // Keep later applies behind the deferred snapshot. Coalescing below
             // retains only one scalar commit per existing ordering interval.
-            if index > 0 && matches!(&self.engine.output.commands[index], Command::Commit { .. }) {
+            if deferred_snapshot && matches!(&self.engine.output.commands[index], Command::Commit { .. }) {
                 index += 1;
                 continue;
             }
@@ -928,9 +967,9 @@ where
                 // These operations observe/provision snapshot state; they do
                 // not change the log or install a new applied frontier. Keep
                 // their exact SM order while running later persistence and
-                // responses in order. Never skip an install, log removal, or
+                // responses in order. Never skip an install, truncation, or
                 // unsatisfied explicit response condition.
-                let independent = self.command_state.bounded_apply.is_pending()
+                let snapshot = self.command_state.bounded_apply.is_pending()
                     && matches!(
                         &cmd,
                         Command::StateMachine { command }
@@ -939,11 +978,16 @@ where
                                 sm::CommandPayload::BuildSnapshot | sm::CommandPayload::BeginReceivingSnapshot { .. }
                             )
                     );
+                // Physical purge waits for both retired readers and paged apply.
+                // Neither wait may delay independent persistence or RPCs, including
+                // when one owner completes while the other is still pending.
+                let purge = matches!(&cmd, Command::PurgeLog { .. });
                 tracing::debug!("postpone command: {:?}", cmd);
                 self.engine.output.postpone_command(index, cmd);
 
-                if independent {
-                    if index == 0 {
+                if snapshot || purge {
+                    if snapshot && !deferred_snapshot {
+                        deferred_snapshot = true;
                         self.engine.output.coalesce_commits();
                     }
                     index += 1;
@@ -958,9 +1002,14 @@ where
 
                 return Ok(());
             }
+            if index > 0 && !deferred_snapshot && self.retired_replications.is_empty() {
+                // QuitLeader may have drained the pool. Retry earlier purges before any
+                // later truncate/install can advance the physical storage frontier.
+                index = 0;
+            }
         }
 
-        if index > 0 {
+        if deferred_snapshot {
             // Executing persistence may generate another leader commit. Fold
             // it into the deferred range before returning to the event loop.
             self.engine.output.coalesce_commits();
@@ -998,6 +1047,12 @@ where
                 _ = &mut rx_shutdown => {
                     tracing::info!("recv from rx_shutdown");
                     return Err(Fatal::Stopped);
+                }
+
+                // Poll before message floods, but never poll an empty stream (which is ready).
+                // Completion wakes an idle core so a deferred purge is retried immediately.
+                result = self.retired_replications.next(), if !self.retired_replications.is_empty() => {
+                    Self::replication_join_result(result.expect("nonempty retirement pool"))?;
                 }
 
                 notify_res = self.rx_notify.recv() => {
@@ -1275,8 +1330,12 @@ where
 
                 match cmd {
                     ExternalCommand::Elect => {
-                        if self.engine.state.membership_state.effective().is_voter(&self.id) {
-                            // TODO: reject if it is already a leader?
+                        if self.engine.leader.is_some() {
+                            // A Leader can not win a campaign it starts: its own heartbeats keep
+                            // refreshing the voters' leader lease, and a lease that has not expired
+                            // rejects the vote request. Leave the established leadership alone.
+                            tracing::info!("ExternalCommand: already a Leader, ignore election trigger");
+                        } else if self.engine.state.membership_state.effective().is_voter(&self.id) {
                             self.engine.elect();
                             tracing::debug!("ExternalCommand: triggered election");
                         } else {
@@ -1442,6 +1501,8 @@ where
                     }
                 }
             }
+
+            Notify::ReplicationFatal { error } => return Err(error),
 
             Notify::StateMachine { command_result } => {
                 tracing::debug!("sm::StateMachine command result: {:?}", command_result);
@@ -1686,7 +1747,7 @@ where
     LS: RaftLogStorage<C>,
     SM: RaftStateMachine<C>,
 {
-    async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, StorageError<C::NodeId>> {
+    async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, Fatal<C::NodeId>> {
         // A log store may wait for applied progress before removing committed
         // entries. Postpone here, where the normal event loop can consume
         // apply responses and dispatch the remaining pages. Never block inside
@@ -1696,6 +1757,13 @@ where
                 &cmd,
                 Command::StateMachine { .. } | Command::PurgeLog { .. } | Command::DeleteConflictLog { .. }
             )
+        {
+            return Ok(Some(cmd));
+        }
+        if !self.retired_replications.is_empty()
+            && (matches!(&cmd, Command::PurgeLog { .. } | Command::DeleteConflictLog { .. })
+                || matches!(&cmd, Command::StateMachine { command }
+                    if matches!(command.payload, sm::CommandPayload::InstallFullSnapshot { .. })))
         {
             return Ok(Some(cmd));
         }
@@ -1740,7 +1808,8 @@ where
                 // A following node may truncate the former leader's suffix.
                 // Join its readers before any later storage command removes
                 // that range; partial append retries still own log reads.
-                self.remove_all_replication().await;
+                self.remove_all_replication();
+                self.drain_retired_replications().await?;
                 self.leader_data = None;
             }
             Command::AppendInputEntries { vote, entries } => {
@@ -1809,12 +1878,14 @@ where
                 self.log_store.save_committed(Some(upto.clone())).await?;
                 if self.config.max_apply_entries.is_some() {
                     let end = upto.index.checked_add(1).ok_or_else(|| {
-                        StorageIOError::write_state_machine(AnyError::error("bounded apply range overflow"))
+                        StorageError::from(StorageIOError::write_state_machine(AnyError::error(
+                            "bounded apply range overflow",
+                        )))
                     })?;
                     self.command_state
                         .bounded_apply
                         .enqueue(seq, already_committed.next_index(), end)
-                        .map_err(|e| StorageIOError::write_state_machine(AnyError::error(e)))?;
+                        .map_err(|e| StorageError::from(StorageIOError::write_state_machine(AnyError::error(e))))?;
                     self.drive_bounded_apply().await?;
                     // Acknowledge durable replication as before. It does not
                     // wait for this committed range to finish applying.
@@ -1835,13 +1906,18 @@ where
                     Inflight::Snapshot { id, last_log_id } => {
                         // unwrap: The replication channel must not be dropped or it is a bug.
                         node.tx_repl.send(Replicate::snapshot(RequestId::new_snapshot(id), last_log_id)).map_err(
-                            |_e| StorageIOError::read_snapshot(None, AnyError::error("replication channel closed")),
+                            |_e| {
+                                StorageError::from(StorageIOError::read_snapshot(
+                                    None,
+                                    AnyError::error("replication channel closed"),
+                                ))
+                            },
                         )?;
                     }
                 }
             }
             Command::RebuildReplicationStreams { targets } => {
-                self.remove_all_replication().await;
+                self.remove_all_replication();
 
                 for (target, matching) in targets.iter() {
                     let handle = self.spawn_replication_stream(target.clone(), matching.clone()).await;
@@ -1851,7 +1927,9 @@ where
             Command::StateMachine { command } => {
                 // Just forward a state machine command to the worker.
                 self.sm_handle.send(command).map_err(|_e| {
-                    StorageIOError::write_state_machine(AnyError::error("can not send to sm::Worker".to_string()))
+                    StorageError::from(StorageIOError::write_state_machine(AnyError::error(
+                        "can not send to sm::Worker",
+                    )))
                 })?;
             }
             Command::Respond { resp: send, .. } => {
