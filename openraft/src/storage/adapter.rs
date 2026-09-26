@@ -107,6 +107,14 @@ where
     ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
         S::try_get_log_entries(self.storage_mut().await.deref_mut(), range).await
     }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
+        S::limited_get_log_entries(self.storage_mut().await.deref_mut(), start, end).await
+    }
 }
 
 impl<C, S> Sealed for Adaptor<C, S>

@@ -57,8 +57,14 @@ The [`RaftStateMachine`] encapsulates several critical responsibilities:
 `Config::max_apply_entries` optionally bounds each runtime apply read. Unset
 preserves the original behavior. When enabled, Openraft asks the storage
 `limited_get_log_entries` reader for at most that many entries; the reader may
-return a shorter nonempty prefix because of its byte limit. Storage must return
+return a shorter nonempty prefix because of its byte limit. The legacy storage
+`Adaptor` forwards this method to the underlying store. Storage must return
 contiguous, complete entries and retain any per-operation deadline across pages.
+An empty, oversized or noncontiguous page terminates the core with a storage
+error before that page reaches the state machine.
+If the state machine returns a different number of results than entries, the
+worker reports a storage error and stops. Pending clients receive that error;
+the core does not acknowledge an applied frontier for the invalid response.
 
 The core retains one active committed range and one coalesced pending range,
 loads one page, and consumes its ordered responses before loading another.
@@ -68,6 +74,10 @@ Durable replication acknowledgements do not wait for application. Snapshot
 commands, log purges and conflict truncations remain ordering barriers; their
 waits return to the normal event loop so remaining pages can make progress.
 Existing replication-task joins remain in effect when leadership changes.
+
+This option applies to runtime application. Startup recovery continues to use
+its existing 64-entry chunks through `try_get_log_entries`, independently of
+`max_apply_entries` and the runtime limited reader.
 
 This option bounds apply entry and response populations, not process RSS.
 Applications must separately bound individual entries/results, API admission,

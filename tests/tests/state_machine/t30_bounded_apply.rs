@@ -1,5 +1,5 @@
-//! Engine scheduling qualification. Memstore is a test double here, not native
-//! SDK storage, durability, transport, or allocated-byte capacity evidence.
+//! Engine scheduling qualification with synthetic entries and an observed test
+//! store. This does not qualify production storage or allocated-byte capacity.
 
 use std::num::NonZeroU64;
 use std::sync::atomic::AtomicUsize;
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use maplit::btreeset;
+use openraft::error::Fatal;
 use openraft::raft::AppendEntriesRequest;
 use openraft::storage::Adaptor;
 use openraft::CommittedLeaderId;
@@ -30,7 +31,9 @@ use openraft::SnapshotPolicy;
 use openraft::StorageError;
 use openraft::StoredMembership;
 use openraft::Vote;
+use openraft_memstore::ClientRequest;
 use openraft_memstore::ClientResponse;
+use openraft_memstore::IntoMemClientRequest;
 use openraft_memstore::MemStore;
 use openraft_memstore::TypeConfig;
 use tokio::sync::oneshot;
@@ -40,6 +43,36 @@ use tokio::sync::Semaphore;
 use crate::fixtures::init_default_ut_tracing;
 use crate::fixtures::RaftRouter;
 
+#[derive(Clone, Copy, Debug)]
+enum ReadMode {
+    Prefix(u64),
+    Empty,
+    Gap,
+    Duplicate,
+    Oversized,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResponseMode {
+    Short,
+    Extra,
+}
+
+#[derive(Clone)]
+struct ReadProbe {
+    mode: ReadMode,
+    requests: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl ReadProbe {
+    fn new(mode: ReadMode) -> Self {
+        Self {
+            mode,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
 struct ObservedStore {
     inner: Arc<MemStore>,
     gate: Arc<Semaphore>,
@@ -48,6 +81,24 @@ struct ObservedStore {
     applied: Arc<Mutex<Vec<u64>>>,
     builder_frontiers: Arc<Mutex<Vec<Option<LogId<u64>>>>>,
     released: Option<oneshot::Sender<()>>,
+    read_probe: Option<ReadProbe>,
+    response_mode: Arc<Mutex<Option<ResponseMode>>>,
+}
+
+impl ObservedStore {
+    fn new(inner: Arc<MemStore>) -> Self {
+        Self {
+            inner,
+            gate: Arc::new(Semaphore::new(0)),
+            entered: watch::channel(0).0,
+            maximum: Arc::new(AtomicUsize::new(0)),
+            applied: Arc::new(Mutex::new(Vec::new())),
+            builder_frontiers: Arc::new(Mutex::new(Vec::new())),
+            released: None,
+            read_probe: None,
+            response_mode: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl Drop for ObservedStore {
@@ -64,6 +115,32 @@ impl RaftLogReader<TypeConfig> for ObservedStore {
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         self.inner.try_get_log_entries(range).await
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        let Some(probe) = &self.read_probe else {
+            return self.inner.limited_get_log_entries(start, end).await;
+        };
+        probe.requests.lock().expect("test observation mutex").push((start, end));
+        match probe.mode {
+            ReadMode::Prefix(limit) => self.inner.try_get_log_entries(start..end.min(start + limit)).await,
+            ReadMode::Empty => Ok(Vec::new()),
+            ReadMode::Gap => {
+                let mut entries = self.inner.try_get_log_entries(start..end).await?;
+                entries.remove(1);
+                Ok(entries)
+            }
+            ReadMode::Duplicate => {
+                let mut entries = self.inner.try_get_log_entries(start..end).await?;
+                entries[1].log_id = entries[0].log_id;
+                Ok(entries)
+            }
+            ReadMode::Oversized => self.inner.try_get_log_entries(start..end + 1).await,
+        }
     }
 }
 
@@ -122,8 +199,15 @@ impl RaftStorage<TypeConfig> for ObservedStore {
         let indices: Vec<_> = entries.iter().map(|entry| entry.log_id.index).collect();
         self.entered.send_modify(|n| *n += 1);
         self.gate.acquire().await.expect("test apply gate remains open").forget();
-        let results = self.inner.apply_to_state_machine(entries).await?;
+        let mut results = self.inner.apply_to_state_machine(entries).await?;
         self.applied.lock().expect("test observation mutex").extend(indices);
+        match *self.response_mode.lock().expect("test observation mutex") {
+            None => {}
+            Some(ResponseMode::Short) => {
+                results.pop();
+            }
+            Some(ResponseMode::Extra) => results.push(ClientResponse(None)),
+        }
         Ok(results)
     }
 
@@ -177,6 +261,8 @@ async fn bounded_apply_preserves_replication_ack_and_complete_ordered_prefix() -
         applied: applied.clone(),
         builder_frontiers: Arc::new(Mutex::new(Vec::new())),
         released: None,
+        read_probe: None,
+        response_mode: Arc::new(Mutex::new(None)),
     };
     let (_, state) = Adaptor::new(state);
     let raft = Raft::<TypeConfig>::new(0, config, network, log, state).await?;
@@ -267,19 +353,27 @@ struct ObservedNode {
     builder_frontiers: Arc<Mutex<Vec<Option<LogId<u64>>>>>,
     entered: watch::Receiver<usize>,
     released: oneshot::Receiver<()>,
+    response_mode: Arc<Mutex<Option<ResponseMode>>>,
 }
 
 impl ObservedNode {
     async fn new(config: Arc<Config>) -> Result<Self> {
+        Self::new_with_reader(config, None).await
+    }
+
+    async fn new_with_reader(config: Arc<Config>, read_probe: Option<ReadProbe>) -> Result<Self> {
         let store = Arc::new(MemStore::new());
         store.enable_saving_committed.store(true, Ordering::Release);
-        let (log, _) = Adaptor::new(store.clone());
+        let mut log_store = ObservedStore::new(store.clone());
+        log_store.read_probe = read_probe;
+        let (log, _) = Adaptor::new(log_store);
         let gate = Arc::new(Semaphore::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let applied = Arc::new(Mutex::new(Vec::new()));
         let builder_frontiers = Arc::new(Mutex::new(Vec::new()));
         let (entered, observed) = watch::channel(0);
         let (released, release_observation) = oneshot::channel();
+        let response_mode = Arc::new(Mutex::new(None));
         let state = ObservedStore {
             inner: store.clone(),
             gate: gate.clone(),
@@ -288,6 +382,8 @@ impl ObservedNode {
             applied: applied.clone(),
             builder_frontiers: builder_frontiers.clone(),
             released: Some(released),
+            read_probe: None,
+            response_mode: response_mode.clone(),
         };
         let (_, state) = Adaptor::new(state);
         let network = RaftRouter::new(config.clone());
@@ -301,6 +397,7 @@ impl ObservedNode {
             builder_frontiers,
             entered: observed,
             released: release_observation,
+            response_mode,
         })
     }
 }
@@ -434,6 +531,8 @@ async fn bounded_apply_shutdown_and_restart_replay_only_unapplied_suffix() -> Re
         applied: node.applied.clone(),
         builder_frontiers: node.builder_frontiers.clone(),
         released: Some(released),
+        read_probe: None,
+        response_mode: Arc::new(Mutex::new(None)),
     };
     let (_, state) = Adaptor::new(state);
     let network = RaftRouter::new(config.clone());
@@ -456,4 +555,146 @@ async fn bounded_apply_shutdown_and_restart_replay_only_unapplied_suffix() -> Re
     );
     assert!(node.maximum.load(Ordering::Acquire) <= 64);
     Ok(())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn bounded_apply_honors_shorter_storage_pages_through_adapter() -> Result<()> {
+    let probe = ReadProbe::new(ReadMode::Prefix(7));
+    let node = ObservedNode::new_with_reader(page_config()?, Some(probe.clone())).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    node.gate.add_permits(129);
+    assert!(
+        tokio::time::timeout_at(deadline, node.raft.append_entries(committed_page_prefix()))
+            .await??
+            .is_success()
+    );
+    tokio::time::timeout_at(
+        deadline,
+        node.raft.wait(None).applied_index(Some(128), "short pages complete"),
+    )
+    .await??;
+    tokio::time::timeout_at(deadline, node.raft.shutdown()).await??;
+    tokio::time::timeout_at(deadline, node.released).await??;
+    assert_eq!(
+        *probe.requests.lock().expect("test observation mutex"),
+        (0..129).step_by(7).map(|start| (start, (start + 64).min(129))).collect::<Vec<_>>(),
+        "BOUNDED_APPLY_READER: preserve the underlying limited-reader contract"
+    );
+    assert!(node.maximum.load(Ordering::Acquire) <= 7);
+    assert_eq!(
+        *node.applied.lock().expect("test observation mutex"),
+        (0..129).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn bounded_apply_rejects_malformed_storage_pages_before_application() -> Result<()> {
+    for mode in [ReadMode::Empty, ReadMode::Gap, ReadMode::Duplicate, ReadMode::Oversized] {
+        let probe = ReadProbe::new(mode);
+        let node = ObservedNode::new_with_reader(page_config()?, Some(probe.clone())).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // If validation is removed, allow erroneous work to finish rather than
+        // leaving the worker blocked at a test gate.
+        node.gate.add_permits(129);
+        // Durable append acknowledgement can precede the apply read failure.
+        let _ack = tokio::time::timeout_at(deadline, node.raft.append_entries(committed_page_prefix())).await?;
+        let metrics = tokio::time::timeout_at(
+            deadline,
+            node.raft.wait(None).metrics(|m| m.running_state.is_err(), "invalid page stops the core"),
+        )
+        .await??;
+        tokio::time::timeout_at(deadline, node.raft.shutdown()).await??;
+        tokio::time::timeout_at(deadline, node.released).await??;
+        assert!(
+            matches!(metrics.running_state, Err(Fatal::StorageError(_))),
+            "BOUNDED_APPLY_INVALID_PAGE: {mode:?} must fail with a storage error, got {:?}",
+            metrics.running_state
+        );
+        assert_eq!(*probe.requests.lock().expect("test observation mutex"), vec![(0, 64)]);
+        assert_eq!(
+            node.maximum.load(Ordering::Acquire),
+            0,
+            "malformed input reached the state machine"
+        );
+        assert!(node.applied.lock().expect("test observation mutex").is_empty());
+    }
+    Ok(())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn bounded_apply_unset_preserves_full_range_reader() -> Result<()> {
+    let mut config = (*page_config()?).clone();
+    config.max_apply_entries = None;
+    let probe = ReadProbe::new(ReadMode::Empty);
+    let node = ObservedNode::new_with_reader(Arc::new(config.validate()?), Some(probe.clone())).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    node.gate.add_permits(1);
+    assert!(
+        tokio::time::timeout_at(deadline, node.raft.append_entries(committed_page_prefix()))
+            .await??
+            .is_success()
+    );
+    tokio::time::timeout_at(
+        deadline,
+        node.raft.wait(None).applied_index(Some(128), "default full range"),
+    )
+    .await??;
+    tokio::time::timeout_at(deadline, node.raft.shutdown()).await??;
+    tokio::time::timeout_at(deadline, node.released).await??;
+    assert!(probe.requests.lock().expect("test observation mutex").is_empty());
+    assert_eq!(node.maximum.load(Ordering::Acquire), 129);
+    assert_eq!(
+        *node.applied.lock().expect("test observation mutex"),
+        (0..129).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+async fn assert_invalid_response_stops_worker_and_client(mode: ResponseMode) -> Result<()> {
+    let node = ObservedNode::new(page_config()?).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    node.gate.add_permits(8);
+    tokio::time::timeout_at(deadline, node.raft.initialize(btreeset! {0})).await??;
+    let initial = tokio::time::timeout_at(
+        deadline,
+        node.raft.client_write(ClientRequest::make_request("client", 0)),
+    )
+    .await??;
+    *node.response_mode.lock().expect("test observation mutex") = Some(mode);
+    let result = tokio::time::timeout_at(
+        deadline,
+        node.raft.client_write(ClientRequest::make_request("client", 1)),
+    )
+    .await;
+    // Cleanup also runs for the panic/timeout regression. Shutdown is bounded
+    // separately from the client operation so a failed assertion leaks no task.
+    tokio::time::timeout(Duration::from_secs(2), node.raft.shutdown()).await??;
+    tokio::time::timeout(Duration::from_secs(2), node.released).await??;
+    assert!(
+        matches!(&result, Ok(Err(err)) if matches!(err.fatal(), Some(Fatal::StorageError(_)))),
+        "BOUNDED_APPLY_RESPONSE: {mode:?} must release the client with a storage error, got {result:?}"
+    );
+    let metrics = node.raft.metrics().borrow().clone();
+    assert!(matches!(metrics.running_state, Err(Fatal::StorageError(_))));
+    assert_eq!(
+        metrics.last_applied,
+        Some(initial.log_id),
+        "an invalid response must not advance applied metrics"
+    );
+    assert_eq!(
+        node.store.get_state_machine().await.last_applied_log.index(),
+        Some(initial.log_id.index + 1)
+    );
+    Ok(())
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn bounded_apply_short_response_releases_client_and_worker() -> Result<()> {
+    assert_invalid_response_stops_worker_and_client(ResponseMode::Short).await
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn bounded_apply_extra_response_releases_client_and_worker() -> Result<()> {
+    assert_invalid_response_stops_worker_and_client(ResponseMode::Extra).await
 }

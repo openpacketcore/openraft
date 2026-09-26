@@ -161,7 +161,9 @@ pub struct Config {
     /// log-removal commands remain ordering barriers. This does not bound API
     /// callers, replication buffers, or the size of an individual entry/result.
     /// Applications must bound those separately and retain their operation
-    /// deadlines across pages. Unset preserves the original apply path.
+    /// deadlines across pages. Startup recovery keeps its existing 64-entry
+    /// chunks independently of this runtime limit. Unset preserves the original
+    /// apply path.
     #[clap(long)]
     pub max_apply_entries: Option<std::num::NonZeroU64>,
 

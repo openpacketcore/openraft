@@ -1,3 +1,4 @@
+use anyerror::AnyError;
 use tokio::sync::mpsc;
 
 use crate::async_runtime::AsyncOneshotSendExt;
@@ -21,6 +22,7 @@ use crate::RaftSnapshotBuilder;
 use crate::RaftTypeConfig;
 use crate::Snapshot;
 use crate::StorageError;
+use crate::StorageIOError;
 
 pub(crate) struct Worker<C, SM>
 where
@@ -148,11 +150,16 @@ where
 
         let n_replies = apply_results.len();
 
-        debug_assert_eq!(
-            n_entries, n_replies,
-            "n_entries: {} should equal n_replies: {}",
-            n_entries, n_replies
-        );
+        if n_entries != n_replies {
+            return Err(StorageIOError::apply(
+                last_applied,
+                AnyError::error(format!(
+                    "state machine returned {} responses for {} entries",
+                    n_replies, n_entries
+                )),
+            )
+            .into());
+        }
 
         let resp = ApplyResult {
             since,

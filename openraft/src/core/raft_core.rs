@@ -1650,8 +1650,8 @@ where
     SM: RaftStateMachine<C>,
 {
     async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, StorageError<C::NodeId>> {
-        // The SDK log adapter may wait for applied progress before removing
-        // committed rows. Postpone here, where the normal event loop can consume
+        // A log store may wait for applied progress before removing committed
+        // entries. Postpone here, where the normal event loop can consume
         // apply responses and dispatch the remaining pages. Never block inside
         // truncation while a later page still needs the core to dispatch it.
         if self.command_state.bounded_apply.is_pending()
