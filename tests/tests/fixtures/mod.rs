@@ -232,6 +232,9 @@ where C::SnapshotData: fmt::Debug
 pub type RPCPreHook =
     Box<dyn Fn(&TypedRaftRouter, RPCRequest<TypeConfig>, MemNodeId, MemNodeId) -> PreHookResult + Send + 'static>;
 
+/// Observe an outgoing request without injecting an RPC failure.
+pub type RPCObserver = Box<dyn Fn(&RPCRequest<TypeConfig>, MemNodeId, MemNodeId) + Send + 'static>;
+
 /// A type which emulates a network transport and implements the `RaftNetworkFactory` trait.
 #[derive(Clone)]
 pub struct TypedRaftRouter {
@@ -264,6 +267,12 @@ pub struct TypedRaftRouter {
 
     /// A hook function to be called when before an RPC is sent to target node.
     rpc_pre_hook: Arc<Mutex<HashMap<RPCTypes, RPCPreHook>>>,
+
+    /// Infallible observers for requests before transmission.
+    rpc_observers: Arc<Mutex<HashMap<RPCTypes, RPCObserver>>>,
+
+    /// Targets whose AppendEntries RPC never returns, emulating a hung follower.
+    blocked_rpc: Arc<Mutex<BTreeSet<MemNodeId>>>,
 }
 
 /// Default `RaftRouter` for memstore.
@@ -300,6 +309,8 @@ impl Builder {
             append_entries_quota: Arc::new(Mutex::new(None)),
             rpc_count: Default::default(),
             rpc_pre_hook: Default::default(),
+            rpc_observers: Default::default(),
+            blocked_rpc: Default::default(),
         }
     }
 }
@@ -328,6 +339,28 @@ impl TypedRaftRouter {
         let r = rand::random::<u64>() % send_delay;
         let timeout = Duration::from_millis(r);
         tokio::time::sleep(timeout).await;
+    }
+
+    /// Make every AppendEntries RPC to `id` hang until it is unblocked.
+    ///
+    /// Unlike [`Self::set_unreachable`], the RPC future never resolves, emulating a follower
+    /// that accepts the request and then stops responding.
+    pub fn set_rpc_blocked(&self, id: MemNodeId, blocked: bool) {
+        let mut blocked_rpc = self.blocked_rpc.lock().unwrap();
+        if blocked {
+            blocked_rpc.insert(id);
+        } else {
+            blocked_rpc.remove(&id);
+        }
+    }
+
+    async fn block_rpc_if_needed(&self, target: MemNodeId) {
+        loop {
+            if !self.blocked_rpc.lock().unwrap().contains(&target) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub fn set_append_entries_quota(&mut self, quota: Option<u64>) {
@@ -532,6 +565,12 @@ impl TypedRaftRouter {
         }
     }
 
+    /// Observe requests without giving an observation callback failure authority.
+    pub fn set_rpc_observer<F>(&self, rpc_type: RPCTypes, observer: F)
+    where F: Fn(&RPCRequest<TypeConfig>, MemNodeId, MemNodeId) + Send + 'static {
+        self.rpc_observers.lock().unwrap().insert(rpc_type, Box::new(observer));
+    }
+
     /// Set a hook function to be called when before an RPC is sent to target node.
     pub fn set_rpc_pre_hook<F>(&self, rpc_type: RPCTypes, hook: F)
     where F: Fn(&TypedRaftRouter, RPCRequest<TypeConfig>, MemNodeId, MemNodeId) -> PreHookResult + Send + 'static {
@@ -560,6 +599,10 @@ impl TypedRaftRouter {
     {
         let request = request.into();
         let typ = request.get_type();
+
+        if let Some(observer) = self.rpc_observers.lock().unwrap().get(&typ) {
+            observer(&request, from, to);
+        }
 
         let rpc_pre_hook = self.rpc_pre_hook.lock().unwrap();
 
@@ -1015,6 +1058,7 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         self.owner.count_rpc(RPCTypes::AppendEntries);
         self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
         self.owner.emit_rpc_error(from_id, self.target)?;
+        self.owner.block_rpc_if_needed(self.target).await;
         self.owner.rand_send_delay().await;
 
         // decrease quota if quota is set

@@ -21,6 +21,9 @@ where
     NID: NodeId,
     N: Node,
 {
+    /// The core's protocol execution result. An error is published before cleanup
+    /// finishes, so API callers can observe its cause without waiting for readers.
+    /// [`ServerState::Shutdown`] is reported only after replication tasks are joined.
     pub running_state: Result<(), Fatal<NID>>,
 
     /// The ID of the Raft node.

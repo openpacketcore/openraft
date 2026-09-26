@@ -1,4 +1,5 @@
 use crate::core::sm;
+use crate::error::Fatal;
 use crate::raft::VoteResponse;
 use crate::replication;
 use crate::MessageSummary;
@@ -38,6 +39,9 @@ where C: RaftTypeConfig
 
     /// Result of executing a command sent from network worker.
     Network { response: replication::Response<C> },
+
+    /// A replication task failed, including a panic in its owned snapshot child.
+    ReplicationFatal { error: Fatal<C::NodeId> },
 
     /// Result of executing a command sent from state machine worker.
     StateMachine { command_result: sm::CommandResult<C> },
@@ -82,6 +86,7 @@ where C: RaftTypeConfig
             Self::Network { response } => {
                 format!("Replication command done: {}", response.summary())
             }
+            Self::ReplicationFatal { error } => format!("Replication task failed: {}", error),
             Self::StateMachine { command_result } => {
                 format!("StateMachine command done: {:?}", command_result)
             }

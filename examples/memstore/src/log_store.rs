@@ -11,7 +11,6 @@ use openraft::LogId;
 use openraft::LogState;
 use openraft::RaftLogId;
 use openraft::RaftTypeConfig;
-use openraft::StorageError;
 use openraft::Vote;
 use tokio::sync::Mutex;
 
@@ -48,18 +47,12 @@ impl<C: RaftTypeConfig> Default for LogStoreInner<C> {
 }
 
 impl<C: RaftTypeConfig> LogStoreInner<C> {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(
-        &mut self,
-        range: RB,
-    ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>>
-    where
-        C::Entry: Clone,
-    {
-        let response = self.log.range(range.clone()).map(|(_, val)| val.clone()).collect::<Vec<_>>();
-        Ok(response)
+    fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(&mut self, range: RB) -> Vec<C::Entry>
+    where C::Entry: Clone {
+        self.log.range(range.clone()).map(|(_, val)| val.clone()).collect()
     }
 
-    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
+    fn get_log_state(&mut self) -> LogState<C> {
         let last = self.log.iter().next_back().map(|(_, ent)| ent.get_log_id().clone());
 
         let last_purged = self.last_purged_log_id.clone();
@@ -69,51 +62,45 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
             Some(x) => Some(x),
         };
 
-        Ok(LogState {
+        LogState {
             last_purged_log_id: last_purged,
             last_log_id: last,
-        })
+        }
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<C::NodeId>>) -> Result<(), StorageError<C::NodeId>> {
+    fn save_committed(&mut self, committed: Option<LogId<C::NodeId>>) {
         self.committed = committed;
-        Ok(())
     }
 
-    async fn read_committed(&mut self) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
-        Ok(self.committed.clone())
+    fn read_committed(&mut self) -> Option<LogId<C::NodeId>> {
+        self.committed.clone()
     }
 
-    async fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+    fn save_vote(&mut self, vote: &Vote<C::NodeId>) {
         self.vote = Some(vote.clone());
-        Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, StorageError<C::NodeId>> {
-        Ok(self.vote.clone())
+    fn read_vote(&mut self) -> Option<Vote<C::NodeId>> {
+        self.vote.clone()
     }
 
-    async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<C::NodeId>>
+    fn append<I>(&mut self, entries: I, callback: LogFlushed<C>)
     where I: IntoIterator<Item = C::Entry> {
         // Simple implementation that calls the flush-before-return `append_to_log`.
         for entry in entries {
             self.log.insert(entry.get_log_id().index, entry);
         }
         callback.log_io_completed(Ok(()));
-
-        Ok(())
     }
 
-    async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+    fn truncate(&mut self, log_id: LogId<C::NodeId>) {
         let keys = self.log.range(log_id.index..).map(|(k, _v)| *k).collect::<Vec<_>>();
         for key in keys {
             self.log.remove(&key);
         }
-
-        Ok(())
     }
 
-    async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+    fn purge(&mut self, log_id: LogId<C::NodeId>) {
         {
             let ld = &mut self.last_purged_log_id;
             assert!(ld.as_ref() <= Some(&log_id));
@@ -126,8 +113,6 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
                 self.log.remove(&key);
             }
         }
-
-        Ok(())
     }
 }
 
@@ -154,7 +139,7 @@ mod impl_log_store {
             range: RB,
         ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.try_get_log_entries(range).await
+            Ok(inner.try_get_log_entries(range))
         }
     }
 
@@ -165,43 +150,48 @@ mod impl_log_store {
 
         async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.get_log_state().await
+            Ok(inner.get_log_state())
         }
 
         async fn save_committed(&mut self, committed: Option<LogId<C::NodeId>>) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.save_committed(committed).await
+            inner.save_committed(committed);
+            Ok(())
         }
 
         async fn read_committed(&mut self) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.read_committed().await
+            Ok(inner.read_committed())
         }
 
         async fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.save_vote(vote).await
+            inner.save_vote(vote);
+            Ok(())
         }
 
         async fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.read_vote().await
+            Ok(inner.read_vote())
         }
 
         async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<C::NodeId>>
         where I: IntoIterator<Item = C::Entry> {
             let mut inner = self.inner.lock().await;
-            inner.append(entries, callback).await
+            inner.append(entries, callback);
+            Ok(())
         }
 
         async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.truncate(log_id).await
+            inner.truncate(log_id);
+            Ok(())
         }
 
         async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.purge(log_id).await
+            inner.purge(log_id);
+            Ok(())
         }
 
         async fn get_log_reader(&mut self) -> Self::LogReader {

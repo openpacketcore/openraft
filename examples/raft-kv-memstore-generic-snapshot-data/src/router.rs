@@ -19,7 +19,7 @@ pub struct Router {
 
 impl Router {
     /// Send request `Req` to target node `to`, and wait for response `Result<Resp, RaftError<E>>`.
-    pub async fn send<Req, Resp, E>(&self, to: NodeId, path: &str, req: Req) -> Result<Resp, RaftError<E>>
+    pub async fn send<Req, Resp, E>(&self, to: NodeId, path: &str, req: Req) -> Result<Resp, Box<RaftError<E>>>
     where
         Req: serde::Serialize,
         Result<Resp, RaftError<E>>: serde::de::DeserializeOwned,
@@ -39,6 +39,6 @@ impl Router {
         let resp_str = resp_rx.await.unwrap();
         tracing::debug!("resp from: {}, {}, {}", to, path, resp_str);
 
-        decode::<Result<Resp, RaftError<E>>>(&resp_str)
+        decode::<Result<Resp, RaftError<E>>>(&resp_str).map_err(Box::new)
     }
 }

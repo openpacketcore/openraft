@@ -4,12 +4,14 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::marker::PhantomData;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyerror::AnyError;
 use futures::stream::FuturesUnordered;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryFutureExt;
 use maplit::btreeset;
@@ -89,6 +91,8 @@ use crate::storage::RaftLogReaderExt;
 use crate::storage::RaftLogStorage;
 use crate::storage::RaftStateMachine;
 use crate::type_config::alias::InstantOf;
+use crate::type_config::alias::JoinErrorOf;
+use crate::type_config::alias::JoinHandleOf;
 use crate::type_config::alias::ResponderOf;
 use crate::type_config::TypeConfigExt;
 use crate::AsyncRuntime;
@@ -187,6 +191,10 @@ where
     /// A mapping of node IDs the replication state of the target node.
     pub(crate) replications: BTreeMap<C::NodeId, ReplicationHandle<C>>,
 
+    /// Every removed generation remains owned until its readers and snapshot child finish.
+    /// Membership rebuild must not wait for these tasks; storage removal and shutdown must.
+    pub(crate) retired_replications: FuturesUnordered<JoinHandleOf<C, Result<(), Fatal<C::NodeId>>>>,
+
     pub(crate) leader_data: Option<LeaderData<C>>,
 
     #[allow(dead_code)]
@@ -224,13 +232,36 @@ where
         rx_shutdown: <C::AsyncRuntime as AsyncRuntime>::OneshotReceiver<()>,
     ) -> Result<Infallible, Fatal<C::NodeId>> {
         let span = tracing::span!(parent: &self.span, Level::DEBUG, "main");
-        let res = self.do_main(rx_shutdown).instrument(span).await;
+        let res = AssertUnwindSafe(self.do_main(rx_shutdown).instrument(span))
+            .catch_unwind()
+            .await
+            .unwrap_or(Err(Fatal::Panicked));
 
-        // Flush buffered metrics
+        // Report the cause immediately, so a dropped API reply does not lose a real
+        // failure while storage readers are still being joined. The server state
+        // remains unchanged until cleanup completes: an error is not a joined shutdown.
         self.report_metrics(None);
+        let mut err = res.unwrap_err();
+        let mut metrics = self.tx_metrics.borrow().clone();
+        metrics.running_state = Err(err.clone());
+        let _ = self.tx_metrics.send(metrics);
+        // No further request can be processed while cleanup owns this task.
+        // Existing responders can remain owned elsewhere; their callers also
+        // observe the fatal metrics signal instead of waiting for those owners.
+        self.rx_api.close();
 
-        // Safe unwrap: res is Result<Infallible, _>
-        let err = res.unwrap_err();
+        // No Shutdown metric or successful shutdown may outlive replication storage access.
+        // Drain all generations even if one fails, preserving the original fatal cause.
+        self.remove_all_replication();
+        let cleanup = self.drain_retired_replications().await;
+        if let Err(cleanup_error) = cleanup {
+            if matches!(err, Fatal::Stopped) {
+                err = cleanup_error;
+            } else {
+                tracing::error!(%cleanup_error, "additional failure during replication cleanup");
+            }
+        }
+
         match err {
             Fatal::Stopped => { /* Normal quit */ }
             _ => {
@@ -260,7 +291,8 @@ where
         tracing::debug!("raft node is initializing");
 
         self.engine.startup();
-        // It may not finish running all of the commands, if there is a command waiting for a callback.
+        // It may not finish running all of the commands, if there is a command waiting for a
+        // callback.
         self.run_engine_commands().await?;
 
         // Initialize metrics.
@@ -389,8 +421,8 @@ where
                     }
                 };
 
-                // If we receive a response with a greater vote, then revert to follower and abort this
-                // request.
+                // If we receive a response with a greater vote, then revert to follower and abort
+                // this request.
                 if let AppendEntriesResponse::HigherVote(vote) = append_res {
                     debug_assert!(
                         vote > my_vote,
@@ -661,6 +693,15 @@ where
         self.engine.snapshot_handler().trigger_snapshot();
     }
 
+    /// Return the current leader node ID based on the committed vote.
+    ///
+    /// In Openraft a leader does not have to be a voter: leadership is determined solely by a
+    /// committed vote, i.e. a vote granted by a quorum, following Paxos semantics. This method
+    /// therefore does not check voter or membership status.
+    ///
+    /// This situation arises when a membership change removes the leader from the voter set, or
+    /// from the membership entirely. The leader keeps operating and committing logs until it steps
+    /// down or a new leader is elected.
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn current_leader(&self) -> Option<C::NodeId> {
         tracing::debug!(
@@ -676,16 +717,7 @@ where
         }
 
         // Safe unwrap(): vote that is committed has to already have voted for some node.
-        let id = vote.leader_id().voted_for().unwrap();
-
-        // TODO: `is_voter()` is slow, maybe cache `current_leader`,
-        //       e.g., only update it when membership or vote changes
-        if self.engine.state.membership_state.effective().is_voter(&id) {
-            Some(id)
-        } else {
-            tracing::debug!("id={} is not a voter", id);
-            None
-        }
+        Some(vote.leader_id().voted_for().unwrap())
     }
 
     /// Retrieves the most recent timestamp that is acknowledged by a quorum.
@@ -766,6 +798,38 @@ where
         Ok(())
     }
 
+    /// Dispatch one bounded page, only after the previous response was consumed.
+    /// The worker never waits for a core acknowledgement, so replication joins
+    /// and snapshot-reader requests cannot create a response-channel deadlock.
+    async fn drive_bounded_apply(&mut self) -> Result<(), StorageError<C::NodeId>> {
+        let Some(limit) = self.config.max_apply_entries else {
+            return Ok(());
+        };
+        let Some((seq, since, end)) = self.command_state.bounded_apply.next_page(limit) else {
+            return Ok(());
+        };
+        let entries = self.log_store.limited_get_log_entries(since, end).await?;
+        let invalid = || StorageIOError::read_log_at_index(since, AnyError::error("invalid bounded apply page"));
+        let count = u64::try_from(entries.len()).map_err(|_| invalid())?;
+        if count == 0
+            || count > end - since
+            || entries.iter().enumerate().any(|(offset, entry)| entry.get_log_id().index != since + offset as u64)
+        {
+            return Err(invalid().into());
+        }
+        // Nonempty, contiguous and wholly within the requested range.
+        let last_applied = entries.last().unwrap().get_log_id().clone();
+        let page_end = last_applied.index.checked_add(1).ok_or_else(invalid)?;
+        self.sm_handle
+            .send(sm::Command::apply(entries).with_seq(seq))
+            .map_err(|e| StorageIOError::apply(last_applied, AnyError::error(e)))?;
+        self.command_state
+            .bounded_apply
+            .sent_page(page_end)
+            .map_err(|e| StorageIOError::write_state_machine(AnyError::error(e)))?;
+        Ok(())
+    }
+
     /// When received results of applying log entries to the state machine, send back responses to
     /// the callers that proposed the entries.
     #[tracing::instrument(level = "debug", skip_all)]
@@ -839,36 +903,48 @@ where
         )
     }
 
-    /// Remove all replication.
+    /// Close all active generations without blocking membership changes on their I/O.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn remove_all_replication(&mut self) {
-        tracing::info!("remove all replication");
-
-        let nodes = std::mem::take(&mut self.replications);
-
-        tracing::debug!(
-            targets = debug(nodes.iter().map(|x| x.0.clone()).collect::<Vec<_>>()),
-            "remove all targets from replication_metrics"
-        );
-
-        for (target, s) in nodes {
-            let handle = s.join_handle;
-
-            // Drop sender to notify the task to shutdown
-            drop(s.tx_repl);
-
-            tracing::debug!("joining removed replication: {}", target);
-            let _x = handle.await;
-            tracing::info!("Done joining removed replication : {}", target);
+    pub fn remove_all_replication(&mut self) {
+        for (target, stream) in std::mem::take(&mut self.replications) {
+            tracing::debug!(%target, "retire replication");
+            // Close every sender before awaiting any task. A removed stream may still own
+            // a log read or a snapshot, even though its progress notifications are stale.
+            drop(stream.tx_repl);
+            self.retired_replications.push(stream.join_handle);
         }
+    }
+
+    fn replication_join_result(
+        result: Result<Result<(), Fatal<C::NodeId>>, JoinErrorOf<C>>,
+    ) -> Result<(), Fatal<C::NodeId>> {
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, "replication task did not finish normally");
+                Err(Fatal::Panicked)
+            }
+        }
+    }
+
+    /// Drain every generation, even when an earlier join fails.
+    async fn drain_retired_replications(&mut self) -> Result<(), Fatal<C::NodeId>> {
+        let mut error = None;
+        while let Some(result) = self.retired_replications.next().await {
+            if let Err(err) = Self::replication_join_result(result) {
+                error.get_or_insert(err);
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 
     /// Run as many commands as possible.
     ///
-    /// If there is a command that waits for a callback, just return and wait for
-    /// next RaftMsg.
+    /// A paged apply can defer a snapshot without deferring unrelated durable
+    /// replication. Other ordering barriers still wait for the next callback.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) async fn run_engine_commands(&mut self) -> Result<(), StorageError<C::NodeId>> {
+    pub(crate) async fn run_engine_commands(&mut self) -> Result<(), Fatal<C::NodeId>> {
+        self.drive_bounded_apply().await?;
         if tracing::enabled!(Level::DEBUG) {
             tracing::debug!("queued commands: start...");
             for c in self.engine.output.iter_commands() {
@@ -877,14 +953,50 @@ where
             tracing::debug!("queued commands: end...");
         }
 
-        while let Some(cmd) = self.engine.output.pop_command() {
+        let mut index = 0;
+        let mut deferred_snapshot = false;
+        while index < self.engine.output.commands.len() {
+            // Keep later applies behind the deferred snapshot. Coalescing below
+            // retains only one scalar commit per existing ordering interval.
+            if deferred_snapshot && matches!(&self.engine.output.commands[index], Command::Commit { .. }) {
+                index += 1;
+                continue;
+            }
+            let cmd = self.engine.output.pop_command(index).unwrap();
             tracing::debug!("run command: {:?}", cmd);
 
             let res = self.run_command(cmd).await?;
 
             if let Some(cmd) = res {
-                tracing::debug!("early return: postpone command: {:?}", cmd);
-                self.engine.output.postpone_command(cmd);
+                // These operations observe/provision snapshot state; they do
+                // not change the log or install a new applied frontier. Keep
+                // their exact SM order while running later persistence and
+                // responses in order. Never skip an install, truncation, or
+                // unsatisfied explicit response condition.
+                let snapshot = self.command_state.bounded_apply.is_pending()
+                    && matches!(
+                        &cmd,
+                        Command::StateMachine { command }
+                            if matches!(
+                                command.payload,
+                                sm::CommandPayload::BuildSnapshot | sm::CommandPayload::BeginReceivingSnapshot { .. }
+                            )
+                    );
+                // Physical purge waits for both retired readers and paged apply.
+                // Neither wait may delay independent persistence or RPCs, including
+                // when one owner completes while the other is still pending.
+                let purge = matches!(&cmd, Command::PurgeLog { .. });
+                tracing::debug!("postpone command: {:?}", cmd);
+                self.engine.output.postpone_command(index, cmd);
+
+                if snapshot || purge {
+                    if snapshot && !deferred_snapshot {
+                        deferred_snapshot = true;
+                        self.engine.output.coalesce_commits();
+                    }
+                    index += 1;
+                    continue;
+                }
 
                 if tracing::enabled!(Level::DEBUG) {
                     for c in self.engine.output.iter_commands().take(8) {
@@ -894,6 +1006,17 @@ where
 
                 return Ok(());
             }
+            if index > 0 && !deferred_snapshot && self.retired_replications.is_empty() {
+                // QuitLeader may have drained the pool. Retry earlier purges before any
+                // later truncate/install can advance the physical storage frontier.
+                index = 0;
+            }
+        }
+
+        if deferred_snapshot {
+            // Executing persistence may generate another leader commit. Fold
+            // it into the deferred range before returning to the event loop.
+            self.engine.output.coalesce_commits();
         }
 
         Ok(())
@@ -913,8 +1036,8 @@ where
         loop {
             self.flush_metrics();
 
-            // In each loop, it does not have to check rx_shutdown and flush metrics for every RaftMsg
-            // processed.
+            // In each loop, it does not have to check rx_shutdown and flush metrics for every
+            // RaftMsg processed.
             // In each loop, the first step is blocking waiting for any message from any channel.
             // Then if there is any message, process as many as possible to maximize throughput.
 
@@ -928,6 +1051,12 @@ where
                 _ = &mut rx_shutdown => {
                     tracing::info!("recv from rx_shutdown");
                     return Err(Fatal::Stopped);
+                }
+
+                // Poll before message floods, but never poll an empty stream (which is ready).
+                // Completion wakes an idle core so a deferred purge is retried immediately.
+                result = self.retired_replications.next(), if !self.retired_replications.is_empty() => {
+                    Self::replication_join_result(result.expect("nonempty retirement pool"))?;
                 }
 
                 notify_res = self.rx_notify.recv() => {
@@ -1205,8 +1334,12 @@ where
 
                 match cmd {
                     ExternalCommand::Elect => {
-                        if self.engine.state.membership_state.effective().is_voter(&self.id) {
-                            // TODO: reject if it is already a leader?
+                        if self.engine.leader.is_some() {
+                            // A Leader can not win a campaign it starts: its own heartbeats keep
+                            // refreshing the voters' leader lease, and a lease that has not expired
+                            // rejects the vote request. Leave the established leadership alone.
+                            tracing::info!("ExternalCommand: already a Leader, ignore election trigger");
+                        } else if self.engine.state.membership_state.effective().is_voter(&self.id) {
                             self.engine.elect();
                             tracing::debug!("ExternalCommand: triggered election");
                         } else {
@@ -1315,11 +1448,12 @@ where
                 // Otherwise the Sender to the caller will be dropped before sending back the
                 // response.
 
-                // TODO: temp solution: Manually wait until the second membership log being applied to state
-                //       machine. Because the response is sent back to the caller after log is
-                //       applied.
+                // TODO: temp solution: Manually wait until the second membership log being applied
+                // to state       machine. Because the response is sent back to the
+                // caller after log is       applied.
                 //       ---
-                //       A better way is to make leader step down a command that waits for the log to be applied.
+                //       A better way is to make leader step down a command that waits for the log
+                // to be applied.
                 if self.engine.state.io_applied() >= self.engine.state.membership_state.effective().log_id().as_ref() {
                     self.engine.leader_step_down();
                 }
@@ -1372,26 +1506,54 @@ where
                 }
             }
 
+            Notify::ReplicationFatal { error } => return Err(error),
+
             Notify::StateMachine { command_result } => {
                 tracing::debug!("sm::StateMachine command result: {:?}", command_result);
 
                 let seq = command_result.command_seq;
                 let res = command_result.result?;
 
-                match res {
-                    // BuildSnapshot is a read operation that does not have to be serialized by
-                    // sm::Worker. Thus it may finish out of order.
-                    sm::Response::BuildSnapshot(_) => {}
-                    _ => {
-                        debug_assert!(
-                            self.command_state.finished_sm_seq < seq,
-                            "sm::StateMachine command result is out of order: expect {} < {}",
-                            self.command_state.finished_sm_seq,
-                            seq
-                        );
+                let complete = if self.config.max_apply_entries.is_some() {
+                    match &res {
+                        sm::Response::Apply(page) => {
+                            let count = page.end.checked_sub(page.since).and_then(|n| usize::try_from(n).ok());
+                            if count != Some(page.applying_entries.len()) || count != Some(page.apply_results.len()) {
+                                return Err(StorageError::from(StorageIOError::write_state_machine(AnyError::error(
+                                    "invalid bounded apply response count",
+                                )))
+                                .into());
+                            }
+                            self.command_state
+                                .bounded_apply
+                                .complete_page(seq, page.since, page.end)
+                                .map_err(|e| {
+                                    StorageError::from(StorageIOError::write_state_machine(AnyError::error(e)))
+                                })?
+                                .is_some()
+                        }
+                        // Read-only snapshot builders can finish out of order.
+                        // They must not move the command frontier backwards.
+                        sm::Response::BuildSnapshot(_) => false,
+                        sm::Response::InstallSnapshot(_) => true,
                     }
+                } else {
+                    true
+                };
+                if complete {
+                    match &res {
+                        sm::Response::BuildSnapshot(_) => {}
+                        _ => {
+                            debug_assert!(
+                                self.command_state.finished_sm_seq < seq,
+                                "sm::StateMachine command result is out of order: expect {} < {}",
+                                self.command_state.finished_sm_seq,
+                                seq
+                            );
+                        }
+                    }
+                    self.command_state.finished_sm_seq = seq;
                 }
-                self.command_state.finished_sm_seq = seq;
 
                 match res {
                     sm::Response::BuildSnapshot(meta) => {
@@ -1535,9 +1697,8 @@ where
     /// it is a stale message and should be just ignored.
     fn does_vote_match(&self, sender_vote: &Vote<C::NodeId>, msg: impl Display) -> bool {
         // Get the current leading vote:
-        // - If input `sender_vote` is committed, it is sent by a Leader. Therefore we check against current
-        //   Leader's vote.
-        // - Otherwise, it is sent by a Candidate, we check against the current in progress voting state.
+        // - A committed `sender_vote` comes from a Leader; compare with our Leader's vote.
+        // - Otherwise, compare with our Candidate's vote for the ongoing election.
         let my_vote = if sender_vote.is_committed() {
             let l = self.engine.leader.as_ref();
             l.map(|x| x.vote.clone())
@@ -1590,7 +1751,26 @@ where
     LS: RaftLogStorage<C>,
     SM: RaftStateMachine<C>,
 {
-    async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, StorageError<C::NodeId>> {
+    async fn run_command(&mut self, cmd: Command<C>) -> Result<Option<Command<C>>, Fatal<C::NodeId>> {
+        // A log store may wait for applied progress before removing committed
+        // entries. Postpone here, where the normal event loop can consume
+        // apply responses and dispatch the remaining pages. Never block inside
+        // truncation while a later page still needs the core to dispatch it.
+        if self.command_state.bounded_apply.is_pending()
+            && matches!(
+                &cmd,
+                Command::StateMachine { .. } | Command::PurgeLog { .. } | Command::DeleteConflictLog { .. }
+            )
+        {
+            return Ok(Some(cmd));
+        }
+        if !self.retired_replications.is_empty()
+            && (matches!(&cmd, Command::PurgeLog { .. } | Command::DeleteConflictLog { .. })
+                || matches!(&cmd, Command::StateMachine { command }
+                    if matches!(command.payload, sm::CommandPayload::InstallFullSnapshot { .. })))
+        {
+            return Ok(Some(cmd));
+        }
         let condition = cmd.condition();
         tracing::debug!("condition: {:?}", condition);
 
@@ -1632,7 +1812,8 @@ where
                 // A following node may truncate the former leader's suffix.
                 // Join its readers before any later storage command removes
                 // that range; partial append retries still own log reads.
-                self.remove_all_replication().await;
+                self.remove_all_replication();
+                self.drain_retired_replications().await?;
                 self.leader_data = None;
             }
             Command::AppendInputEntries { vote, entries } => {
@@ -1699,7 +1880,22 @@ where
                 ref upto,
             } => {
                 self.log_store.save_committed(Some(upto.clone())).await?;
-                self.apply_to_state_machine(seq, already_committed.next_index(), upto.index).await?;
+                if self.config.max_apply_entries.is_some() {
+                    let end = upto.index.checked_add(1).ok_or_else(|| {
+                        StorageError::from(StorageIOError::write_state_machine(AnyError::error(
+                            "bounded apply range overflow",
+                        )))
+                    })?;
+                    self.command_state
+                        .bounded_apply
+                        .enqueue(seq, already_committed.next_index(), end)
+                        .map_err(|e| StorageError::from(StorageIOError::write_state_machine(AnyError::error(e))))?;
+                    self.drive_bounded_apply().await?;
+                    // Acknowledge durable replication as before. It does not
+                    // wait for this committed range to finish applying.
+                } else {
+                    self.apply_to_state_machine(seq, already_committed.next_index(), upto.index).await?;
+                }
             }
             Command::Replicate { req, target } => {
                 let node = self.replications.get(&target).expect("replication to target node exists");
@@ -1714,13 +1910,18 @@ where
                     Inflight::Snapshot { id, last_log_id } => {
                         // unwrap: The replication channel must not be dropped or it is a bug.
                         node.tx_repl.send(Replicate::snapshot(RequestId::new_snapshot(id), last_log_id)).map_err(
-                            |_e| StorageIOError::read_snapshot(None, AnyError::error("replication channel closed")),
+                            |_e| {
+                                StorageError::from(StorageIOError::read_snapshot(
+                                    None,
+                                    AnyError::error("replication channel closed"),
+                                ))
+                            },
                         )?;
                     }
                 }
             }
             Command::RebuildReplicationStreams { targets } => {
-                self.remove_all_replication().await;
+                self.remove_all_replication();
 
                 for (target, matching) in targets.iter() {
                     let handle = self.spawn_replication_stream(target.clone(), matching.clone()).await;
@@ -1730,7 +1931,9 @@ where
             Command::StateMachine { command } => {
                 // Just forward a state machine command to the worker.
                 self.sm_handle.send(command).map_err(|_e| {
-                    StorageIOError::write_state_machine(AnyError::error("can not send to sm::Worker".to_string()))
+                    StorageError::from(StorageIOError::write_state_machine(AnyError::error(
+                        "can not send to sm::Worker",
+                    )))
                 })?;
             }
             Command::Respond { resp: send, .. } => {

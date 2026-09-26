@@ -46,7 +46,7 @@ impl RaftNetwork<TypeConfig> for Connection {
             .router
             .send(self.target, "/raft/append", req)
             .await
-            .map_err(|e| RemoteError::new(self.target, e))?;
+            .map_err(|e| RemoteError::new(self.target, *e))?;
         Ok(resp)
     }
 
@@ -62,7 +62,7 @@ impl RaftNetwork<TypeConfig> for Connection {
             .router
             .send::<_, _, typ::Infallible>(self.target, "/raft/snapshot", (vote, snapshot.meta, snapshot.snapshot))
             .await
-            .map_err(|e| RemoteError::new(self.target, e.into_fatal().unwrap()))?;
+            .map_err(|e| RemoteError::new(self.target, (*e).into_fatal().unwrap()))?;
         Ok(resp)
     }
 
@@ -75,7 +75,7 @@ impl RaftNetwork<TypeConfig> for Connection {
             .router
             .send(self.target, "/raft/vote", req)
             .await
-            .map_err(|e| RemoteError::new(self.target, e))?;
+            .map_err(|e| RemoteError::new(self.target, *e))?;
         Ok(resp)
     }
 }

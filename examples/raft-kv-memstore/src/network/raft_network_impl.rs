@@ -28,7 +28,7 @@ impl Network {
         target_node: &BasicNode,
         uri: &str,
         req: Req,
-    ) -> Result<Resp, openraft::error::RPCError<NodeId, BasicNode, Err>>
+    ) -> Result<Resp, Box<openraft::error::RPCError<NodeId, BasicNode, Err>>>
     where
         Req: Serialize,
         Err: std::error::Error + DeserializeOwned,
@@ -43,8 +43,8 @@ impl Network {
         tracing::debug!("client is created for: {}", url);
 
         let resp = client.post(url).json(&req).send().await.map_err(|e| {
-            // If the error is a connection error, we return `Unreachable` so that connection isn't retried
-            // immediately.
+            // If the error is a connection error, we return `Unreachable` so that connection isn't
+            // retried immediately.
             if e.is_connect() {
                 return openraft::error::RPCError::Unreachable(Unreachable::new(&e));
             }
@@ -56,7 +56,7 @@ impl Network {
         let res: Result<Resp, Err> =
             resp.json().await.map_err(|e| openraft::error::RPCError::Network(NetworkError::new(&e)))?;
 
-        res.map_err(|e| openraft::error::RPCError::RemoteError(RemoteError::new(target, e)))
+        res.map_err(|e| Box::new(openraft::error::RPCError::RemoteError(RemoteError::new(target, e))))
     }
 }
 
@@ -86,7 +86,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         req: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
-        self.owner.send_rpc(self.target, &self.target_node, "raft-append", req).await
+        self.owner.send_rpc(self.target, &self.target_node, "raft-append", req).await.map_err(|e| *e)
     }
 
     async fn install_snapshot(
@@ -94,7 +94,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         req: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, typ::RPCError<InstallSnapshotError>> {
-        self.owner.send_rpc(self.target, &self.target_node, "raft-snapshot", req).await
+        self.owner.send_rpc(self.target, &self.target_node, "raft-snapshot", req).await.map_err(|e| *e)
     }
 
     async fn vote(
@@ -102,6 +102,6 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         req: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, typ::RPCError> {
-        self.owner.send_rpc(self.target, &self.target_node, "raft-vote", req).await
+        self.owner.send_rpc(self.target, &self.target_node, "raft-vote", req).await.map_err(|e| *e)
     }
 }

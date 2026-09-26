@@ -288,6 +288,7 @@ where C: RaftTypeConfig
             client_resp_channels: BTreeMap::new(),
 
             replications: Default::default(),
+            retired_replications: Default::default(),
             leader_data: None,
 
             tx_api: tx_api.clone(),
@@ -631,6 +632,8 @@ where C: RaftTypeConfig
     ///   read.
     /// - `Err(RaftError<CheckIsLeaderError>)` if it detects a higher term, or if it fails to
     ///   communicate with a quorum of followers.
+    /// - `Err(RaftError::Fatal)` if the core fails before the required state has been applied. A
+    ///   published failure is returned without waiting for storage cleanup to finish.
     ///
     /// # Examples
     /// ```ignore
@@ -645,15 +648,29 @@ where C: RaftTypeConfig
         let (read_log_id, applied) = self.get_read_log_id().await?;
 
         if read_log_id.index() > applied.index() {
-            self.wait(None)
-                .applied_index_at_least(read_log_id.index(), "ensure_linearizable")
-                .await
-                .map_err(|e| match e {
-                    WaitError::Timeout(_, _) => {
-                        unreachable!("did not specify timeout")
-                    }
-                    WaitError::ShuttingDown => Fatal::Stopped,
-                })?;
+            let metrics = self
+                .wait(None)
+                .metrics(
+                    |metrics| metrics.last_applied.index() >= read_log_id.index() || metrics.running_state.is_err(),
+                    "ensure_linearizable",
+                )
+                .await;
+            let metrics = match metrics {
+                Ok(metrics) => metrics,
+                Err(WaitError::Timeout(_, _)) => unreachable!("did not specify timeout"),
+                Err(WaitError::ShuttingDown) => {
+                    return Err(self
+                        .inner
+                        .get_core_stopped_error("waiting for read application", None::<u64>)
+                        .await
+                        .into());
+                }
+            };
+            // An already-applied read remains valid even if a later operation
+            // failed before this waiter was polled again.
+            if metrics.last_applied.index() < read_log_id.index() {
+                metrics.running_state?;
+            }
         }
         Ok(read_log_id)
     }
@@ -879,16 +896,7 @@ where C: RaftTypeConfig
             }
         });
 
-        match rx.await {
-            Ok(res) => Ok(res),
-            Err(err) => {
-                tracing::error!(error = display(&err), "{}: rx recv error", func_name!());
-
-                let when = format!("{}: rx recv", func_name!());
-                let fatal = self.inner.get_core_stopped_error(when, None::<u64>).await;
-                Err(fatal)
-            }
-        }
+        self.inner.recv_msg(rx).await
     }
 
     /// Send a request to the Raft core loop in a fire-and-forget manner.

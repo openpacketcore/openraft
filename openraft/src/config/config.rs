@@ -152,6 +152,21 @@ pub struct Config {
     #[clap(long, default_value = "300")]
     pub max_payload_entries: u64,
 
+    /// Opt in to bounded state-machine apply reads.
+    ///
+    /// At most this many entries are loaded with `limited_get_log_entries` for
+    /// one apply page. The storage reader may return fewer because of its byte
+    /// limit. Only one page and its response are outstanding; adjacent pending
+    /// committed ranges coalesce without retaining entries. State-machine and
+    /// log-removal commands remain ordering barriers. This does not bound API
+    /// callers, replication buffers, or the size of an individual entry/result.
+    /// Applications must bound those separately and retain their operation
+    /// deadlines across pages. Startup recovery keeps its existing 64-entry
+    /// chunks independently of this runtime limit. Unset preserves the original
+    /// apply path.
+    #[clap(long)]
+    pub max_apply_entries: Option<std::num::NonZeroU64>,
+
     /// The distance behind in log replication a follower must fall before it is considered lagging
     ///
     /// A follower falls behind this index are replicated with snapshot.

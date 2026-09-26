@@ -19,7 +19,6 @@ use crate::engine::EngineConfig;
 use crate::engine::LogIdList;
 use crate::raft::VoteRequest;
 use crate::testing::log_id;
-use crate::utime::UTime;
 use crate::AsyncRuntime;
 use crate::CommittedLeaderId;
 use crate::Config;
@@ -28,7 +27,6 @@ use crate::LogId;
 use crate::Membership;
 use crate::OptionalSend;
 use crate::RaftTypeConfig;
-use crate::TokioInstant;
 use crate::TokioRuntime;
 use crate::Vote;
 
@@ -275,8 +273,8 @@ fn test_elect_single_node() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_elect_single_node_elect_again() -> anyhow::Result<()> {
-    tracing::info!("--- single node: electing again will override previous state");
+fn test_elect_again_overrides_previous_campaign() -> anyhow::Result<()> {
+    tracing::info!("--- electing again bumps the term and overrides the previous campaign");
     {
         let mut eng = eng();
         eng.config.id = 1;
@@ -284,10 +282,11 @@ fn test_elect_single_node_elect_again() -> anyhow::Result<()> {
             .membership_state
             .set_effective(Arc::new(EffectiveMembership::new(Some(log_id(0, 1, 1)), m1())));
 
-        // Build in-progress election state
-        eng.state.vote = UTime::new(TokioInstant::now(), Vote::new_committed(1, 2));
-        eng.testing_new_leader();
-        eng.candidate_mut().map(|candidate| candidate.grant_by(&1));
+        // The first campaign, to be overridden by the second one.
+        eng.elect();
+        assert_eq!(Vote::new(1, 1), *eng.state.vote_ref());
+        assert_eq!(Vote::new(1, 1), *eng.candidate_ref().unwrap().vote_ref());
+        eng.output.take_commands();
 
         eng.elect();
 
