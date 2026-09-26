@@ -128,7 +128,14 @@ where C: RaftTypeConfig
         if self.state.is_leader(&self.config.id) {
             self.become_leader();
         } else if self.state.is_leading(&self.config.id) {
-            // candidate, nothing to do
+            // An accepted uncommitted self-vote can supersede a prior leader
+            // or campaign without starting an election. Keep only a candidate
+            // for this exact vote; elect() creates that candidate before voting.
+            *self.leader = None;
+            if self.candidate.as_ref().is_some_and(|candidate| candidate.vote_ref() != self.state.vote_ref()) {
+                *self.candidate = None;
+            }
+            self.server_state_handler().update_server_state_if_changed();
         } else {
             self.become_following();
         }
