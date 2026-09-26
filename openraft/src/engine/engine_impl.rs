@@ -404,10 +404,8 @@ where C: RaftTypeConfig
         // 1. A node was a leader but its state reverted to a previous version
         // 2. The node restarts and begins election
         // 3. It receives a vote response containing its own previous leader vote
-        // 4. Without this protection, it would update to that committed vote and become leader
-        //    again
-        // 5. However, it lacks the necessary logs, causing committed entries to be lost or
-        //    inconsistent
+        // 4. Accepting that committed vote would make it leader again
+        // 5. Its missing logs would cause lost or inconsistent committed entries
         //
         // By using the non-committed version, we prevent this reverted node from becoming leader
         // while still allowing proper vote updates for legitimate cases.

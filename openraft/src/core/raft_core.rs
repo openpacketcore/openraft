@@ -1596,10 +1596,8 @@ where
     /// it is a stale message and should be just ignored.
     fn does_vote_match(&self, sender_vote: &Vote<C::NodeId>, msg: impl Display) -> bool {
         // Get the current leading vote:
-        // - If input `sender_vote` is committed, it is sent by a Leader. Therefore we check against
-        //   current Leader's vote.
-        // - Otherwise, it is sent by a Candidate, we check against the current in progress voting
-        //   state.
+        // - A committed `sender_vote` comes from a Leader; compare with our Leader's vote.
+        // - Otherwise, compare with our Candidate's vote for the ongoing election.
         let my_vote = if sender_vote.is_committed() {
             let l = self.engine.leader.as_ref();
             l.map(|x| x.vote.clone())
