@@ -71,8 +71,16 @@ loads one page, and consumes its ordered responses before loading another.
 Partial pages advance the applied log frontier, but do not complete the whole
 state-machine command. Every accepted entry still gets one ordered result.
 Durable replication acknowledgements do not wait for application. Snapshot
-commands, log purges and conflict truncations remain ordering barriers; their
-waits return to the normal event loop so remaining pages can make progress.
+building and receive preparation retain the full preceding apply range while
+later append/vote persistence and independent responses can proceed in order.
+Successor commits stay after that snapshot and coalesce into one scalar command
+per existing state-machine, log-removal or explicit response-condition interval.
+Coalescing retains the first start, latest end and latest command sequence, and
+keeps the combined command after all of its persistence dependencies. This does
+not bound the number of independently requested state-machine operations.
+Snapshot installation, log purges, conflict truncations and unsatisfied response
+conditions retain their ordering barriers. Their waits return to the normal
+event loop so remaining pages can make progress.
 Existing replication-task joins remain in effect when leadership changes.
 
 This option applies to runtime application. Startup recovery continues to use

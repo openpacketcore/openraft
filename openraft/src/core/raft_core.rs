@@ -898,8 +898,8 @@ where
 
     /// Run as many commands as possible.
     ///
-    /// If there is a command that waits for a callback, just return and wait for
-    /// next RaftMsg.
+    /// A paged apply can defer a snapshot without deferring unrelated durable
+    /// replication. Other ordering barriers still wait for the next callback.
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn run_engine_commands(&mut self) -> Result<(), StorageError<C::NodeId>> {
         self.drive_bounded_apply().await?;
@@ -911,14 +911,44 @@ where
             tracing::debug!("queued commands: end...");
         }
 
-        while let Some(cmd) = self.engine.output.pop_command() {
+        let mut index = 0;
+        while index < self.engine.output.commands.len() {
+            // Keep later applies behind the deferred snapshot. Coalescing below
+            // retains only one scalar commit per existing ordering interval.
+            if index > 0 && matches!(&self.engine.output.commands[index], Command::Commit { .. }) {
+                index += 1;
+                continue;
+            }
+            let cmd = self.engine.output.pop_command(index).unwrap();
             tracing::debug!("run command: {:?}", cmd);
 
             let res = self.run_command(cmd).await?;
 
             if let Some(cmd) = res {
-                tracing::debug!("early return: postpone command: {:?}", cmd);
-                self.engine.output.postpone_command(cmd);
+                // These operations observe/provision snapshot state; they do
+                // not change the log or install a new applied frontier. Keep
+                // their exact SM order while running later persistence and
+                // responses in order. Never skip an install, log removal, or
+                // unsatisfied explicit response condition.
+                let independent = self.command_state.bounded_apply.is_pending()
+                    && matches!(
+                        &cmd,
+                        Command::StateMachine { command }
+                            if matches!(
+                                command.payload,
+                                sm::CommandPayload::BuildSnapshot | sm::CommandPayload::BeginReceivingSnapshot { .. }
+                            )
+                    );
+                tracing::debug!("postpone command: {:?}", cmd);
+                self.engine.output.postpone_command(index, cmd);
+
+                if independent {
+                    if index == 0 {
+                        self.engine.output.coalesce_commits();
+                    }
+                    index += 1;
+                    continue;
+                }
 
                 if tracing::enabled!(Level::DEBUG) {
                     for c in self.engine.output.iter_commands().take(8) {
@@ -928,6 +958,12 @@ where
 
                 return Ok(());
             }
+        }
+
+        if index > 0 {
+            // Executing persistence may generate another leader commit. Fold
+            // it into the deferred range before returning to the event loop.
+            self.engine.output.coalesce_commits();
         }
 
         Ok(())
