@@ -92,7 +92,8 @@ pub fn init_default_ut_tracing() {
 
     START.call_once(|| {
         let mut g = GLOBAL_UT_LOG_GUARD.as_ref().lock().unwrap();
-        *g = Some(init_global_tracing("ut", "_log", "DEBUG"));
+        let log_dir = env::var("OPENRAFT_TEST_LOG_DIR").unwrap_or_else(|_| "_log".to_string());
+        *g = Some(init_global_tracing("ut", &log_dir, "DEBUG"));
     });
 }
 

@@ -49,6 +49,13 @@ where C: RaftTypeConfig
 impl<C> SnapshotReader<C>
 where C: RaftTypeConfig
 {
+    /// An unavailable reader for replication tests that never request snapshots.
+    #[cfg(test)]
+    pub(crate) fn closed_for_test() -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Self { cmd_tx: tx.downgrade() }
+    }
+
     /// Get a snapshot from the state machine.
     ///
     /// If the state machine worker has shutdown, it will return an error.
