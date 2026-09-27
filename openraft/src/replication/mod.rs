@@ -7,6 +7,9 @@ pub(crate) mod request;
 pub(crate) mod request_id;
 pub(crate) mod response;
 
+#[cfg(test)]
+mod no_progress_test;
+
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -243,6 +246,7 @@ where
 
             // Backup the log data for retrying.
             let mut log_data = None;
+            let mut retry_at = None;
 
             tracing::debug!(replication_data = display(&d), "{} send replication RPC", func_name!());
 
@@ -255,11 +259,11 @@ where
                     let d = DataWithId::new(RequestId::new_heartbeat(), LogIdRange::new(m.clone(), m.clone()));
 
                     log_data = Some(d.clone());
-                    self.send_log_entries(d).await
+                    self.send_log_entries(d, &mut retry_at).await
                 }
                 Data::Logs(log) => {
                     log_data = Some(log.clone());
-                    self.send_log_entries(log).await
+                    self.send_log_entries(log, &mut retry_at).await
                 }
                 Data::Snapshot(snap) => {
                     // Never replace an owned child's handle before it has completed.
@@ -345,6 +349,15 @@ where
                 }
             };
 
+            if let Some(until) = retry_at {
+                // Keep the original retry, but bound repeated reads and encoding.
+                // Commit/heartbeat events coalesce without extending this deadline;
+                // channel closure still terminates the owned replication future.
+                if let Err(closed) = self.drain_events_until(until).await {
+                    tracing::debug!(%closed, "replication closed during no-progress cooldown");
+                    return Ok(());
+                }
+            }
             if let Err(closed) = self.drain_events_with_backoff().await {
                 tracing::debug!(%closed, "replication closed");
                 return Ok(());
@@ -410,6 +423,7 @@ where
     async fn send_log_entries(
         &mut self,
         log_ids: DataWithId<LogIdRange<C::NodeId>>,
+        retry_at: &mut Option<InstantOf<C>>,
     ) -> Result<Option<Data<C>>, ReplicationError<C::NodeId, C::Node>> {
         let request_id = log_ids.request_id();
 
@@ -532,6 +546,13 @@ where
             }
             AppendEntriesResponse::PartialSuccess(matching) => {
                 Self::debug_assert_partial_success(&sending_range, &matching);
+                if matching == sending_range.prev && sending_range.prev < sending_range.last {
+                    // A legal partial response can match only the predecessor.
+                    // Count RPC time toward the cooldown and respect shorter
+                    // heartbeats. Zero intervals still need a nonzero spin bound.
+                    let retry_millis = self.config.heartbeat_interval.clamp(1, 10);
+                    *retry_at = Some(leader_time + Duration::from_millis(retry_millis));
+                }
                 let next = self.finish_success_append(matching, leader_time, log_ids);
                 Ok(next)
             }
@@ -647,20 +668,21 @@ where
             func_name!()
         );
 
+        self.drain_events_until(until).await
+    }
+
+    /// Drain events until one fixed deadline. Legal non-progress replies use this
+    /// without emitting the warning reserved for an unreachable peer.
+    async fn drain_events_until(&mut self, until: InstantOf<C>) -> Result<(), ReplicationClosed> {
+        let sleep = C::sleep_until(until);
+        futures::pin_mut!(sleep);
+
         loop {
-            let sleep_duration = until - C::now();
-            let sleep = C::sleep(sleep_duration);
-
-            let recv = self.rx_event.recv();
-
-            tracing::debug!("backoff timeout: {:?}", sleep_duration);
-
             select! {
-                _ = sleep => {
-                    tracing::debug!("backoff timeout");
+                _ = &mut sleep => {
                     return Ok(());
                 }
-                recv_res = recv => {
+                recv_res = self.rx_event.recv() => {
                     let event = recv_res.ok_or(ReplicationClosed::new("RaftCore closed replication"))?;
                     self.process_event(event);
                 }
