@@ -390,3 +390,25 @@ fn test_handle_pre_vote_req_rejected_by_quorum_acknowledged_lease() -> anyhow::R
 
     Ok(())
 }
+
+#[test]
+fn test_handle_pre_vote_resp_rejection_never_adopts_a_vote_for_this_node() -> anyhow::Result<()> {
+    let mut eng = eng(m123());
+    eng.pre_elect();
+    eng.output.take_commands();
+    let vote_before = *eng.state.vote_ref();
+    let proposed = *eng.pre_candidate_ref().unwrap().vote_ref();
+    assert!(proposed > vote_before);
+
+    // A network that cannot ask the voter answers with a rejection of its own. If it echoed the
+    // proposed vote, adopting it would vote for this node in a term it never campaigned in.
+    eng.handle_pre_vote_resp(3, VoteResponse::new(proposed, None, false));
+
+    assert_eq!(vote_before, *eng.state.vote_ref());
+    assert!(
+        eng.pre_candidate_ref().is_some(),
+        "the round keeps waiting for real answers"
+    );
+    assert_eq!(0, eng.output.take_commands().len());
+    Ok(())
+}
