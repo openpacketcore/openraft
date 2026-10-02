@@ -1738,14 +1738,9 @@ where
             tracing::info!("election timeout passed, check if it is a voter for election");
         }
 
-        // A node that rejected a candidate for its log, and has heard from no leader for one
-        // election timeout since, campaigns without Pre-Vote: see `Engine::stale_candidate`.
-        let stale_candidate_due =
-            self.engine.stale_candidate_campaign_due(now, self.engine.config.timer_config.election_timeout);
-
         // Pre-Vote applies to multiple voters only: a single voter always wins its own Pre-Vote.
-        let pre_vote =
-            self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && voter_count > 1 && !stale_candidate_due;
+        // A voter that cannot answer it makes this node run the classic election instead.
+        let pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && voter_count > 1;
 
         if pre_vote {
             // A Pre-Vote round does not update the vote, so the expired election timer would
