@@ -412,3 +412,51 @@ fn test_handle_pre_vote_resp_rejection_never_adopts_a_vote_for_this_node() -> an
     assert_eq!(0, eng.output.take_commands().len());
     Ok(())
 }
+
+/// A grant that waited in the notification queue must not reach a later round.
+///
+/// Rounds in one term share their hypothetical vote. A same-term AppendEntries that removes a
+/// voter ends the round; if its flush outlasts the election timeout, the next tick starts a new
+/// round with the same vote. The removed voter's grant for the ended round, delivered only then,
+/// cannot be told apart by that vote, and it must neither count nor stop this node.
+#[test]
+fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round() -> anyhow::Result<()> {
+    let mut eng = eng(m123());
+    eng.pre_elect();
+    eng.output.take_commands();
+    let first_round_vote = *eng.pre_candidate_ref().unwrap().vote_ref();
+
+    // Leader 2 replicates a membership without voter 3 in its unchanged term, which ends the round.
+    eng.vote_handler().update_vote(&Vote::new_committed(1, 2))?;
+    assert!(eng.pre_candidate_ref().is_none());
+    eng.state
+        .membership_state
+        .set_effective(Arc::new(EffectiveMembership::new(Some(log_id(1, 2, 3)), m12())));
+
+    // The flush outlasts the election timeout, and the queued tick starts a new round.
+    eng.state.vote = UTime::new(TokioInstant::now() - Duration::from_secs(1), Vote::new_committed(1, 2));
+    eng.pre_elect();
+    eng.output.take_commands();
+    assert_eq!(
+        first_round_vote,
+        *eng.pre_candidate_ref().unwrap().vote_ref(),
+        "both rounds propose the same vote"
+    );
+
+    // Voter 3's grant for the first round arrives now.
+    eng.handle_pre_vote_resp(
+        3,
+        VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true),
+    );
+
+    assert!(eng.pre_candidate_ref().is_some(), "the new round keeps waiting");
+    assert_eq!(
+        btreeset! {1},
+        eng.pre_candidate_ref().unwrap().granters().collect::<BTreeSet<_>>()
+    );
+    assert!(eng.candidate_ref().is_none(), "no real election starts");
+    assert_eq!(Vote::new_committed(1, 2), *eng.state.vote_ref());
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
