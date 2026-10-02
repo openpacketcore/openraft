@@ -360,6 +360,9 @@ impl Run {
             config: Arc::new(
                 Config {
                     heartbeat_interval,
+                    // No election runs here; keep the timeouts valid for every heartbeat interval.
+                    election_timeout_min: 10_000,
+                    election_timeout_max: 10_001,
                     ..Config::default()
                 }
                 .validate()

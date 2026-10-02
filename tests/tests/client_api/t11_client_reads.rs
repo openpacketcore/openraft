@@ -78,8 +78,8 @@ async fn get_read_log_id() -> Result<()> {
             enable_heartbeat: false,
             enable_elect: false,
             heartbeat_interval: 100,
-            election_timeout_min: 101,
-            election_timeout_max: 102,
+            election_timeout_min: 151,
+            election_timeout_max: 152,
             ..Default::default()
         }
         .validate()?,

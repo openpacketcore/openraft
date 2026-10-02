@@ -117,6 +117,10 @@ pub struct Config {
     pub cluster_name: String,
 
     /// The minimum election timeout in milliseconds
+    ///
+    /// It must exceed three halves of `heartbeat_interval`, the interval at which a leader sends
+    /// heartbeats, and should be at least twice that so one late heartbeat does not start an
+    /// election. It is also the follower's leader lease.
     #[clap(long, default_value = "150")]
     pub election_timeout_min: u64,
 
@@ -363,7 +367,10 @@ impl Config {
             });
         }
 
-        if self.election_timeout_min <= self.heartbeat_interval {
+        // A leader sends heartbeats on its engine tick, every three halves of the heartbeat
+        // interval. A follower campaigns once its sampled election timeout expires, so the
+        // smallest timeout has to outlast that tick.
+        if self.election_timeout_min <= self.heartbeat_interval.saturating_mul(3) / 2 {
             return Err(ConfigError::ElectionTimeoutLTHeartBeat {
                 election_timeout_min: self.election_timeout_min,
                 heartbeat_interval: self.heartbeat_interval,

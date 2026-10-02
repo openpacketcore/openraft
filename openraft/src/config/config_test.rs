@@ -99,6 +99,32 @@ fn test_build() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_election_timeout_min_must_outlast_the_heartbeat_tick() {
+    // Heartbeats go out every three halves of the heartbeat interval: 150 ms here.
+    let config = Config {
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        heartbeat_interval: 100,
+        ..Default::default()
+    };
+    assert_eq!(
+        config.validate().unwrap_err(),
+        ConfigError::ElectionTimeoutLTHeartBeat {
+            election_timeout_min: 150,
+            heartbeat_interval: 100
+        }
+    );
+
+    let config = Config {
+        election_timeout_min: 151,
+        election_timeout_max: 300,
+        heartbeat_interval: 100,
+        ..Default::default()
+    };
+    assert!(config.validate().is_ok());
+}
+
+#[test]
 fn test_config_append_entries_timeout() -> anyhow::Result<()> {
     let config = Config::build(&["foo", "--heartbeat-interval=40"])?;
     assert_eq!(None, config.append_entries_timeout);
