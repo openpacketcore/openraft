@@ -5,6 +5,7 @@ use anyhow::Result;
 use maplit::btreeset;
 use openraft::Config;
 use openraft::ServerState;
+use tokio::time::sleep;
 use tokio::time::Instant;
 
 use crate::fixtures::init_default_ut_tracing;
@@ -18,6 +19,10 @@ use crate::fixtures::RaftRouter;
 /// `election_timeout_max` plus one tick of the last leader contact, never before
 /// `election_timeout_min`. Waiting for the sum would hold every survivor back for at least
 /// `election_timeout_max + election_timeout_min`.
+///
+/// The first campaign is observed as a survivor's term exceeding the lost leader's term, whether
+/// or not that campaign wins: a survivor whose last leader contact was a little later can still
+/// reject it under its own lease, and then a later campaign elects the new leader.
 #[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
 async fn leader_loss_campaign_overlaps_lease_and_election_timeout() -> Result<()> {
     let config = Arc::new(
@@ -47,9 +52,43 @@ async fn leader_loss_campaign_overlaps_lease_and_election_timeout() -> Result<()
             .await?;
     }
 
+    let leader_term = n0.metrics().borrow().current_term;
+
     tracing::info!("--- lose the leader: node 0 can neither send nor receive");
     let lost_at = Instant::now();
     router.set_network_error(0, true);
+
+    tracing::info!("--- a survivor campaigns: its term exceeds the lost leader's term");
+    let survivors = [router.get_raft_handle(&1)?, router.get_raft_handle(&2)?];
+    let campaigned = loop {
+        if survivors.iter().any(|n| n.metrics().borrow().current_term > leader_term) {
+            break lost_at.elapsed();
+        }
+        assert!(
+            lost_at.elapsed() < Duration::from_secs(10),
+            "a survivor campaigns after the leader loss"
+        );
+        sleep(Duration::from_millis(5)).await;
+    };
+    tracing::info!("--- a survivor campaigned {:?} after the leader loss", campaigned);
+
+    // The last leader contact is at most one tick before the loss. The campaign then starts on
+    // the first tick after the longer of the lease and the sampled timeout; the remaining slack
+    // covers polling and scheduling.
+    let slack = Duration::from_millis(600);
+    assert!(
+        campaigned < election_timeout_max + tick + slack,
+        "the first campaign waits for the longer of the lease and the timeout, not their sum: \
+         campaigned after {:?}, expected below {:?}",
+        campaigned,
+        election_timeout_max + tick + slack
+    );
+    assert!(
+        campaigned + tick >= election_timeout_min,
+        "the lease still holds back every campaign: campaigned after {:?}, lease {:?}",
+        campaigned,
+        election_timeout_min
+    );
 
     tracing::info!("--- a survivor is elected");
     for id in [1, 2] {
@@ -61,26 +100,6 @@ async fn leader_loss_campaign_overlaps_lease_and_election_timeout() -> Result<()
             )
             .await?;
     }
-    let elapsed = lost_at.elapsed();
-    tracing::info!("--- a survivor was elected {:?} after the leader loss", elapsed);
-
-    // The last leader contact is at most one tick before the loss. The campaign then starts on
-    // the first tick after the longer of the lease and the sampled timeout; the remaining slack
-    // covers the in-memory vote round trip and scheduling.
-    let slack = Duration::from_millis(600);
-    assert!(
-        elapsed < election_timeout_max + tick + slack,
-        "the first campaign waits for the longer of the lease and the timeout, not their sum: \
-         elected after {:?}, expected below {:?}",
-        elapsed,
-        election_timeout_max + tick + slack
-    );
-    assert!(
-        elapsed + tick >= election_timeout_min,
-        "the lease still holds back every campaign: elected after {:?}, lease {:?}",
-        elapsed,
-        election_timeout_min
-    );
 
     Ok(())
 }
