@@ -1744,12 +1744,20 @@ where
 
         if pre_vote {
             // A Pre-Vote round does not update the vote, so the expired election timer would
-            // restart it on every tick. Keep a round in flight for one sampled election timeout.
-            let timer_config = &self.engine.config.timer_config;
-            let mut round_timeout = timer_config.election_timeout;
-            if self.engine.is_there_greater_log() {
-                round_timeout += timer_config.smaller_log_timeout;
-            }
+            // restart it on every tick. Keep a round in flight for the width of the
+            // election-timeout window, then retry it on a later tick.
+            //
+            // After an unplanned leader loss, a round fails while a voter's lease still runs, and
+            // every lease runs out within the minimum election timeout of the loss. A survivor's
+            // first round starts within the maximum election timeout and a tick of its last leader
+            // contact, and each retry within the window's width and a tick of the round before.
+            // So the survivor with the most up-to-date log starts a round that no lease rejects
+            // within the maximum election timeout and a tick of the loss. Holding a rejected round
+            // for a whole sampled election timeout could double that.
+            let engine_config = &self.engine.config;
+            let round_timeout = Duration::from_millis(
+                engine_config.election_timeout_max.saturating_sub(engine_config.election_timeout_min),
+            );
 
             if let Some(started) = self.engine.pre_candidate_ref().map(|x| x.starting_time()) {
                 if now < started + round_timeout {
