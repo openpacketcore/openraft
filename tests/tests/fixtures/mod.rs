@@ -271,6 +271,9 @@ pub struct TypedRaftRouter {
     /// one of them is reported as unsupported without reaching it.
     pre_vote_unsupported: Arc<Mutex<BTreeSet<MemNodeId>>>,
 
+    /// How long the reply to a Pre-Vote sent to a node takes to arrive, per target.
+    pre_vote_reply_delay: Arc<Mutex<BTreeMap<MemNodeId, Duration>>>,
+
     /// A hook function to be called when before an RPC is sent to target node.
     rpc_pre_hook: Arc<Mutex<HashMap<RPCTypes, RPCPreHook>>>,
 
@@ -318,6 +321,7 @@ impl Builder {
             append_entries_quota: Arc::new(Mutex::new(None)),
             rpc_count: Default::default(),
             pre_vote_unsupported: Default::default(),
+            pre_vote_reply_delay: Default::default(),
             rpc_pre_hook: Default::default(),
             rpc_observers: Default::default(),
             blocked_rpc: Default::default(),
@@ -574,6 +578,22 @@ impl TypedRaftRouter {
     /// Set whether to emit a specified rpc error when sending to/receiving from a node.
     /// Report every Pre-Vote to `id` as unsupported without reaching it, as a network does for a
     /// voter of a release without Pre-Vote.
+    /// Delay the reply to every Pre-Vote sent to `id` by `delay`, or remove the delay with `None`.
+    ///
+    /// A target that answers is asked at once and its answer is held back; an answer reported as
+    /// unsupported is held back the same way.
+    pub fn set_pre_vote_reply_delay(&self, id: MemNodeId, delay: Option<Duration>) {
+        let mut delays = self.pre_vote_reply_delay.lock().unwrap();
+        match delay {
+            Some(delay) => {
+                delays.insert(id, delay);
+            }
+            None => {
+                delays.remove(&id);
+            }
+        }
+    }
+
     pub fn set_pre_vote_unsupported(&self, id: MemNodeId, unsupported: bool) {
         let mut nodes = self.pre_vote_unsupported.lock().unwrap();
         if unsupported {
@@ -1195,17 +1215,24 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         self.owner.emit_rpc_error(from_id, self.target)?;
         self.owner.rand_send_delay().await;
 
-        if self.owner.pre_vote_unsupported.lock().unwrap().contains(&self.target) {
+        let reply_delay = self.owner.pre_vote_reply_delay.lock().unwrap().get(&self.target).copied();
+
+        let reply = if self.owner.pre_vote_unsupported.lock().unwrap().contains(&self.target) {
             // Send nothing to a voter that cannot answer Pre-Vote.
-            return Ok(PreVoteReply::Unsupported);
+            PreVoteReply::Unsupported
+        } else {
+            let node = self.owner.get_raft_handle(&self.target)?;
+
+            let resp = node.pre_vote(rpc).await;
+            let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
+            PreVoteReply::Answered(resp)
+        };
+
+        if let Some(delay) = reply_delay {
+            tokio::time::sleep(delay).await;
         }
 
-        let node = self.owner.get_raft_handle(&self.target)?;
-
-        let resp = node.pre_vote(rpc).await;
-        let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
-
-        Ok(PreVoteReply::Answered(resp))
+        Ok(reply)
     }
 }
 

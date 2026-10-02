@@ -17,3 +17,4 @@ mod t22_one_way_isolation;
 mod t23_classic_voter_stale_log;
 mod t24_classic_leader_one_way;
 mod t25_rejected_pre_vote_retry;
+mod t26_delayed_pre_vote_replies;
