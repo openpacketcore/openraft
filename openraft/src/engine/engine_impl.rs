@@ -37,6 +37,7 @@ use crate::proposer::LeaderQuorumSet;
 use crate::proposer::LeaderState;
 use crate::raft::responder::Responder;
 use crate::raft::AppendEntriesResponse;
+use crate::raft::PreVoteReply;
 use crate::raft::SnapshotResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
@@ -562,16 +563,19 @@ where C: RaftTypeConfig
         VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), granted)
     }
 
-    /// Handle a response to the Pre-Vote round `round`.
+    /// Handle a reply to the Pre-Vote round `round`.
     ///
     /// Count a granted Pre-Vote; once a quorum would grant, start the real election. A rejection
     /// that reports a greater log delays the next campaign, and one that reports a strictly higher
     /// vote catches this node up to that vote in non-committed form, as a rejected real vote does.
-    /// A response to any round but the one in flight is ignored.
-    #[tracing::instrument(level = "debug", skip(self, resp))]
-    pub(crate) fn handle_pre_vote_resp(&mut self, target: C::NodeId, round: u64, resp: VoteResponse<C::NodeId>) {
+    ///
+    /// A voter that cannot answer Pre-Vote ends the round, and this node runs the classic election
+    /// for this campaign at once: Pre-Vote is used only while every voter that can be reached
+    /// answers it. A reply to any round but the one in flight is ignored.
+    #[tracing::instrument(level = "debug", skip(self, reply))]
+    pub(crate) fn handle_pre_vote_resp(&mut self, target: C::NodeId, round: u64, reply: PreVoteReply<C::NodeId>) {
         tracing::info!(
-            resp = display(resp.summary()),
+            reply = display(&reply),
             target = display(&target),
             round,
             my_vote = display(self.state.vote_ref()),
@@ -583,14 +587,34 @@ where C: RaftTypeConfig
         if round != self.pre_vote_round {
             tracing::info!(
                 current_round = self.pre_vote_round,
-                "ignore a response to an earlier Pre-Vote round"
+                "ignore a reply to an earlier Pre-Vote round"
             );
             return;
         }
 
         let Some(pre_candidate) = self.pre_candidate.as_mut() else {
-            // The Pre-Vote round has finished or been canceled; ignore the delayed response.
+            // The Pre-Vote round has finished or been canceled; ignore the delayed reply.
             return;
+        };
+
+        let resp = match reply {
+            PreVoteReply::Answered(resp) => resp,
+            PreVoteReply::Unsupported => {
+                if !self.state.membership_state.effective().is_voter(&target) {
+                    tracing::warn!("ignore a Pre-Vote reply from a node that does not vote");
+                    return;
+                }
+                // The voter can still grant a vote, but it can never grant a Pre-Vote: without it
+                // a Pre-Vote quorum may never form. Campaign as a node without Pre-Vote does.
+                self.pre_candidate = None;
+                if self.leader.is_some() || !self.state.membership_state.effective().is_voter(&self.config.id) {
+                    tracing::info!("a voter cannot answer Pre-Vote, but this node leads or no longer votes");
+                    return;
+                }
+                tracing::info!("a voter cannot answer Pre-Vote; start the classic election");
+                self.elect();
+                return;
+            }
         };
 
         // The responder does not adopt the Pre-Vote, so a grant is read from `vote_granted`.
@@ -619,7 +643,7 @@ where C: RaftTypeConfig
         // Catch up to a strictly higher vote, never as committed. An equal vote is left alone: it
         // would end the in-flight round without new information. A vote for this node is not
         // adopted either: no voter holds one for a term this node did not campaign in, so it can
-        // only be a network's own answer, and adopting it would vote for this node unsent.
+        // only be a faulty answer, and adopting it would vote for this node unsent.
         if &resp.vote > self.state.vote_ref() && resp.vote.leader_id().voted_for() != Some(self.config.id.clone()) {
             let mut vote = resp.vote.clone();
             vote.committed = false;

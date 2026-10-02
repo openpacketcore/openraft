@@ -12,6 +12,7 @@ use crate::network::rpc_option::RPCOption;
 use crate::network::Backoff;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
+use crate::raft::PreVoteReply;
 use crate::raft::SnapshotResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
@@ -86,18 +87,28 @@ where C: RaftTypeConfig
     /// a vote or changing its term. It is only sent when
     /// [`Config::enable_pre_vote`](`crate::Config::enable_pre_vote`) is enabled.
     ///
-    /// The default implementation reports a granted Pre-Vote without contacting the target, so a
-    /// network that does not implement it makes Pre-Vote a no-op and elections proceed as without
-    /// it. An implementation that cannot reach the target must return an error instead: an error
-    /// is never counted as a grant, so a voter that is cut off cannot assemble a quorum.
+    /// Send the request and return [`PreVoteReply::Answered`] only for a target that is positively
+    /// known to answer Pre-Vote: the capability was negotiated on the connection to it, or it is
+    /// an in-process peer that passes the request to [`Raft::pre_vote()`]. For any other target
+    /// that can be reached, such as a voter of a release without Pre-Vote, send nothing and return
+    /// [`PreVoteReply::Unsupported`]: the node then runs the classic election for this campaign,
+    /// because such a voter can grant a vote but can never answer the Pre-Vote. The default
+    /// implementation returns `Unsupported`, so a network that does not implement Pre-Vote always
+    /// runs the classic election.
+    ///
+    /// Return an error for a target that cannot be reached. It is never counted as a grant, so a
+    /// voter that is cut off cannot assemble a quorum, and it does not force the classic election:
+    /// a voter that cannot be reached can grant neither a Pre-Vote nor a vote. Never return an
+    /// error for a target that answers votes but not Pre-Vote, or no Pre-Vote quorum that needs it
+    /// can ever be reached.
     ///
     /// [`Raft::pre_vote()`]: crate::Raft::pre_vote
     async fn pre_vote(
         &mut self,
-        rpc: VoteRequest<C::NodeId>,
+        _rpc: VoteRequest<C::NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
-        Ok(VoteResponse::new(rpc.vote, None, true))
+    ) -> Result<PreVoteReply<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+        Ok(PreVoteReply::Unsupported)
     }
 
     /// Send a complete Snapshot to the target.

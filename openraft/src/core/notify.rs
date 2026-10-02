@@ -1,5 +1,6 @@
 use crate::core::sm;
 use crate::error::Fatal;
+use crate::raft::PreVoteReply;
 use crate::raft::VoteResponse;
 use crate::replication;
 use crate::MessageSummary;
@@ -22,7 +23,7 @@ where C: RaftTypeConfig
 
     PreVoteResponse {
         target: C::NodeId,
-        resp: VoteResponse<C::NodeId>,
+        reply: PreVoteReply<C::NodeId>,
 
         /// The Pre-Vote round that sent the request.
         round: u64,
@@ -81,13 +82,8 @@ where C: RaftTypeConfig
             } => {
                 format!("VoteResponse: from: {}: {}, res-vote: {}", target, resp.summary(), vote)
             }
-            Self::PreVoteResponse { target, resp, round } => {
-                format!(
-                    "PreVoteResponse: from: {}: {}, round: {}",
-                    target,
-                    resp.summary(),
-                    round
-                )
+            Self::PreVoteResponse { target, reply, round } => {
+                format!("PreVoteResponse: from: {}: {}, round: {}", target, reply, round)
             }
             Self::HigherVote {
                 ref target,

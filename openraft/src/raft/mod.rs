@@ -38,6 +38,7 @@ pub use message::ClientWriteResponse;
 pub use message::ClientWriteResult;
 pub use message::InstallSnapshotRequest;
 pub use message::InstallSnapshotResponse;
+pub use message::PreVoteReply;
 pub use message::SnapshotResponse;
 pub use message::TransferLeaderError;
 pub use message::TransferLeaderRequest;

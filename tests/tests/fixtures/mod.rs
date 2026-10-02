@@ -43,6 +43,7 @@ use openraft::raft::AppendEntriesResponse;
 use openraft::raft::ClientWriteResponse;
 use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
+use openraft::raft::PreVoteReply;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::storage::Adaptor;
@@ -267,7 +268,7 @@ pub struct TypedRaftRouter {
     rpc_count: Arc<Mutex<HashMap<RPCTypes, u64>>>,
 
     /// Nodes that cannot answer Pre-Vote, such as voters of a release without it. A Pre-Vote to
-    /// one of them is answered as a rejection without reaching it.
+    /// one of them is reported as unsupported without reaching it.
     pre_vote_unsupported: Arc<Mutex<BTreeSet<MemNodeId>>>,
 
     /// A hook function to be called when before an RPC is sent to target node.
@@ -571,7 +572,7 @@ impl TypedRaftRouter {
     }
 
     /// Set whether to emit a specified rpc error when sending to/receiving from a node.
-    /// Answer every Pre-Vote to `id` as a rejection without reaching it, as a network does for a
+    /// Report every Pre-Vote to `id` as unsupported without reaching it, as a network does for a
     /// voter of a release without Pre-Vote.
     pub fn set_pre_vote_unsupported(&self, id: MemNodeId, unsupported: bool) {
         let mut nodes = self.pre_vote_unsupported.lock().unwrap();
@@ -1186,7 +1187,7 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         &mut self,
         rpc: VoteRequest<MemNodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
+    ) -> Result<PreVoteReply<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
         let from_id = rpc.vote.leader_id().voted_for().unwrap();
 
         self.owner.count_rpc(RPCTypes::Vote);
@@ -1195,8 +1196,8 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         self.owner.rand_send_delay().await;
 
         if self.owner.pre_vote_unsupported.lock().unwrap().contains(&self.target) {
-            // A rejection that carries no vote to catch up to.
-            return Ok(VoteResponse::new(Vote::new(0, from_id), None, false));
+            // Send nothing to a voter that cannot answer Pre-Vote.
+            return Ok(PreVoteReply::Unsupported);
         }
 
         let node = self.owner.get_raft_handle(&self.target)?;
@@ -1204,7 +1205,7 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         let resp = node.pre_vote(rpc).await;
         let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
 
-        Ok(resp)
+        Ok(PreVoteReply::Answered(resp))
     }
 }
 

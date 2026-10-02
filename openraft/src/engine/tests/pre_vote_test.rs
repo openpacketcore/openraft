@@ -11,6 +11,7 @@ use crate::engine::Command;
 use crate::engine::Engine;
 use crate::engine::LogIdList;
 use crate::progress::Progress;
+use crate::raft::PreVoteReply;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::testing::log_id;
@@ -188,7 +189,11 @@ fn test_handle_pre_vote_resp_quorum_starts_real_election() -> anyhow::Result<()>
     eng.handle_pre_vote_resp(
         3,
         eng.pre_vote_round,
-        VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true),
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            true,
+        )),
     );
 
     assert!(
@@ -222,7 +227,11 @@ fn test_handle_pre_vote_resp_rejection_keeps_waiting() -> anyhow::Result<()> {
     eng.handle_pre_vote_resp(
         3,
         eng.pre_vote_round,
-        VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), false),
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            false,
+        )),
     );
 
     assert!(eng.pre_candidate_ref().is_some(), "the round is still in flight");
@@ -235,7 +244,11 @@ fn test_handle_pre_vote_resp_rejection_keeps_waiting() -> anyhow::Result<()> {
     eng.handle_pre_vote_resp(
         2,
         eng.pre_vote_round,
-        VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 5)), false),
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 5)),
+            false,
+        )),
     );
     assert!(eng.is_there_greater_log());
     assert!(eng.pre_candidate_ref().is_some());
@@ -253,7 +266,11 @@ fn test_handle_pre_vote_resp_rejection_adopts_a_higher_vote() -> anyhow::Result<
     eng.handle_pre_vote_resp(
         3,
         eng.pre_vote_round,
-        VoteResponse::new(Vote::new_committed(5, 3), Some(log_id(1, 2, 3)), false),
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(5, 3),
+            Some(log_id(1, 2, 3)),
+            false,
+        )),
     );
 
     // Catch up to the strictly higher term, never as committed, and end the round.
@@ -276,7 +293,7 @@ fn test_handle_pre_vote_resp_rejection_with_equal_vote_keeps_the_round() -> anyh
     eng.handle_pre_vote_resp(
         3,
         eng.pre_vote_round,
-        VoteResponse::new(vote_before, Some(log_id(1, 2, 3)), false),
+        PreVoteReply::Answered(VoteResponse::new(vote_before, Some(log_id(1, 2, 3)), false)),
     );
 
     assert!(
@@ -306,7 +323,7 @@ fn test_accepted_vote_ends_the_pre_vote_round() -> anyhow::Result<()> {
     eng.handle_pre_vote_resp(
         3,
         eng.pre_vote_round,
-        VoteResponse::new(leader_vote, Some(log_id(1, 2, 3)), true),
+        PreVoteReply::Answered(VoteResponse::new(leader_vote, Some(log_id(1, 2, 3)), true)),
     );
     assert!(eng.candidate_ref().is_none());
     assert_eq!(leader_vote, *eng.state.vote_ref());
@@ -338,7 +355,11 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     eng.handle_pre_vote_resp(
         2,
         eng.pre_vote_round,
-        VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true),
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            true,
+        )),
     );
     assert_eq!(Vote::new(2, 1), *eng.candidate_ref().unwrap().vote_ref());
     // The local vote is granted once it is persisted.
@@ -358,7 +379,7 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     eng.handle_pre_vote_resp(
         2,
         eng.pre_vote_round,
-        VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 2, 3)), true),
+        PreVoteReply::Answered(VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 2, 3)), true)),
     );
     assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
     assert_eq!(ServerState::Leader, eng.state.server_state);
@@ -418,9 +439,13 @@ fn test_handle_pre_vote_resp_rejection_never_adopts_a_vote_for_this_node() -> an
     let proposed = *eng.pre_candidate_ref().unwrap().vote_ref();
     assert!(proposed > vote_before);
 
-    // A network that cannot ask the voter answers with a rejection of its own. If it echoed the
-    // proposed vote, adopting it would vote for this node in a term it never campaigned in.
-    eng.handle_pre_vote_resp(3, eng.pre_vote_round, VoteResponse::new(proposed, None, false));
+    // A faulty answer that echoes the proposed vote must not be adopted: that would vote for this
+    // node in a term it never campaigned in.
+    eng.handle_pre_vote_resp(
+        3,
+        eng.pre_vote_round,
+        PreVoteReply::Answered(VoteResponse::new(proposed, None, false)),
+    );
 
     assert_eq!(vote_before, *eng.state.vote_ref());
     assert!(
@@ -465,7 +490,7 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
 
     // Voter 3's grant for the first round arrives now.
     let grant = VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true);
-    eng.handle_pre_vote_resp(3, first_round, grant.clone());
+    eng.handle_pre_vote_resp(3, first_round, PreVoteReply::Answered(grant.clone()));
 
     assert!(eng.pre_candidate_ref().is_some(), "the new round keeps waiting");
     assert_eq!(
@@ -477,7 +502,7 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
     assert_eq!(0, eng.output.take_commands().len());
 
     // Even a grant that names the new round cannot count for a node outside its quorum set.
-    eng.handle_pre_vote_resp(3, eng.pre_vote_round, grant);
+    eng.handle_pre_vote_resp(3, eng.pre_vote_round, PreVoteReply::Answered(grant));
 
     assert!(eng.pre_candidate_ref().is_some(), "the new round keeps waiting");
     assert_eq!(
@@ -485,6 +510,63 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
         eng.pre_candidate_ref().unwrap().granters().collect::<BTreeSet<_>>()
     );
     assert!(eng.candidate_ref().is_none(), "no real election starts");
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+/// A voter that cannot answer Pre-Vote ends the round, and this node runs the classic election.
+///
+/// Such a voter can still grant a vote but never a Pre-Vote, so a Pre-Vote quorum that needs it
+/// would never form.
+#[test]
+fn test_unsupported_pre_vote_runs_the_classic_election() -> anyhow::Result<()> {
+    let mut eng = eng(m123());
+    eng.pre_elect();
+    eng.output.take_commands();
+
+    eng.handle_pre_vote_resp(3, eng.pre_vote_round, PreVoteReply::Unsupported);
+
+    assert!(eng.pre_candidate_ref().is_none(), "the classic election ends the round");
+    assert_eq!(
+        Vote::new(2, 1),
+        *eng.state.vote_ref(),
+        "the classic election bumps the term"
+    );
+    assert!(eng.candidate_ref().is_some());
+    assert_eq!(ServerState::Candidate, eng.state.server_state);
+
+    let commands = eng.output.take_commands();
+    assert!(commands.contains(&Command::SaveVote { vote: Vote::new(2, 1) }));
+    assert!(commands.contains(&Command::SendVote {
+        vote_req: VoteRequest::new(Vote::new(2, 1), Some(log_id(1, 2, 3))),
+    }));
+
+    Ok(())
+}
+
+/// Only the round in flight, and only a voter, can make this node run the classic election.
+#[test]
+fn test_unsupported_pre_vote_of_an_ended_round_or_a_non_voter_starts_nothing() -> anyhow::Result<()> {
+    let mut eng = eng(m12());
+    eng.pre_elect();
+    eng.output.take_commands();
+    let vote_before = *eng.state.vote_ref();
+
+    // Node 3 is not a voter.
+    eng.handle_pre_vote_resp(3, eng.pre_vote_round, PreVoteReply::Unsupported);
+    assert!(eng.pre_candidate_ref().is_some(), "the round keeps waiting");
+
+    // A reply to an earlier round.
+    eng.handle_pre_vote_resp(2, eng.pre_vote_round - 1, PreVoteReply::Unsupported);
+    assert!(eng.pre_candidate_ref().is_some(), "the round keeps waiting");
+
+    // A reply after a heartbeat ended the round.
+    eng.vote_handler().update_vote(&vote_before)?;
+    eng.handle_pre_vote_resp(2, eng.pre_vote_round, PreVoteReply::Unsupported);
+
+    assert!(eng.candidate_ref().is_none(), "no election starts");
+    assert_eq!(vote_before, *eng.state.vote_ref());
     assert_eq!(0, eng.output.take_commands().len());
 
     Ok(())

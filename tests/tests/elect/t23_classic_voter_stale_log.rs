@@ -28,11 +28,11 @@ fn pre_vote_config() -> Result<Arc<Config>> {
 /// Voters that cannot answer Pre-Vote, such as voters of a release without it, and that miss the
 /// last entries do not block an election.
 ///
-/// The survivors with the up-to-date log run Pre-Vote, and the network answers their Pre-Vote to a
-/// classic voter as a rejection, so they cannot reach a Pre-Vote quorum without those voters. The
-/// classic voters campaign with the classic vote, but their logs are behind, so they cannot win
-/// either. A survivor that rejects such a candidate for its log must campaign itself, without
-/// Pre-Vote and in a term above that candidate's, or no leader is ever elected.
+/// The survivors with the up-to-date log can win only with a classic voter's vote, and a classic
+/// voter can never grant a Pre-Vote: the network reports it as unsupported, so the survivors run
+/// the classic election instead. The classic voters campaign with the classic vote too, but their
+/// logs are behind, so they cannot win. A survivor campaigns in a term above every candidate it
+/// rejected for its log, so their terms do not hold its campaign back.
 async fn classic_voters_with_stale_logs_do_not_block_an_election(voter_count: u64) -> Result<()> {
     let config = pre_vote_config()?;
     let mut router = RaftRouter::new(config.clone());

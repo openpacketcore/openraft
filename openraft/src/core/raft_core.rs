@@ -1225,51 +1225,58 @@ where
                     let vote = vote.clone();
 
                     async move {
-                        let tm_res = match kind {
-                            VoteRequestKind::Vote => C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await,
-                            VoteRequestKind::PreVote { .. } => {
-                                C::AsyncRuntime::timeout(ttl, client.pre_vote(req, option)).await
-                            }
+                        let timeout_err = || Timeout {
+                            action: RPCTypes::Vote,
+                            id: id.clone(),
+                            target: target.clone(),
+                            timeout: ttl,
                         };
-                        let res = match tm_res {
-                            Ok(res) => res,
-
-                            Err(_timeout) => {
-                                let timeout_err = Timeout {
-                                    action: RPCTypes::Vote,
-                                    id,
-                                    target: target.clone(),
-                                    timeout: ttl,
-                                };
-                                tracing::error!(
-                                    {error = %timeout_err, target = display(&target)},
-                                    "timeout while requesting {}",
-                                    kind.as_str()
-                                );
-                                return;
-                            }
-                        };
-
-                        match res {
-                            Ok(resp) => {
-                                let notify = match kind {
-                                    VoteRequestKind::Vote => Notify::VoteResponse {
-                                        target,
+                        let notify = match kind {
+                            VoteRequestKind::Vote => {
+                                match C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await {
+                                    Ok(Ok(resp)) => Notify::VoteResponse {
+                                        target: target.clone(),
                                         resp,
                                         sender_vote: vote,
                                     },
-                                    VoteRequestKind::PreVote { round } => {
-                                        Notify::PreVoteResponse { target, resp, round }
+                                    Ok(Err(err)) => {
+                                        tracing::error!({error=%err, target=display(&target)}, "while requesting vote");
+                                        return;
                                     }
-                                };
-                                let _ = tx.send(notify);
+                                    Err(_timeout) => {
+                                        tracing::error!(
+                                            {error = %timeout_err(), target = display(&target)},
+                                            "timeout while requesting vote"
+                                        );
+                                        return;
+                                    }
+                                }
                             }
-                            Err(err) => tracing::error!(
-                                {error=%err, target=display(&target)},
-                                "while requesting {}",
-                                kind.as_str()
-                            ),
-                        }
+                            VoteRequestKind::PreVote { round } => {
+                                match C::AsyncRuntime::timeout(ttl, client.pre_vote(req, option)).await {
+                                    Ok(Ok(reply)) => Notify::PreVoteResponse {
+                                        target: target.clone(),
+                                        reply,
+                                        round,
+                                    },
+                                    Ok(Err(err)) => {
+                                        tracing::error!(
+                                            {error=%err, target=display(&target)},
+                                            "while requesting pre-vote"
+                                        );
+                                        return;
+                                    }
+                                    Err(_timeout) => {
+                                        tracing::error!(
+                                            {error = %timeout_err(), target = display(&target)},
+                                            "timeout while requesting pre-vote"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+                        let _ = tx.send(notify);
                     }
                 }
                 .instrument(tracing::debug_span!(
@@ -1448,9 +1455,9 @@ where
                 }
             }
 
-            Notify::PreVoteResponse { target, resp, round } => {
+            Notify::PreVoteResponse { target, reply, round } => {
                 tracing::info!(
-                    resp = display(resp.summary()),
+                    reply = display(&reply),
                     target = display(&target),
                     round,
                     "received Notify::PreVoteResponse: {}",
@@ -1459,7 +1466,7 @@ where
 
                 // Rounds in one term propose the same vote, so only the round identifier tells a
                 // delayed response from a current one. The engine ignores any other round.
-                self.engine.handle_pre_vote_resp(target, round, resp);
+                self.engine.handle_pre_vote_resp(target, round, reply);
             }
 
             Notify::HigherVote {
