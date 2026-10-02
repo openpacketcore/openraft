@@ -1840,13 +1840,6 @@ where
             true
         }
     }
-    /// A Pre-Vote response belongs to the in-flight Pre-Vote round only if it answers that round's
-    /// vote; otherwise it is stale and ignored.
-    ///
-    /// Two rounds in the same term carry the same vote. A response still cannot reach a later
-    /// round: each request is abandoned after `election_timeout_min`, a new round starts no earlier
-    /// than one sampled election timeout after the previous one, and responses and ticks are
-    /// delivered in order on the same channel.
     /// If a message is sent by a previous replication session but is received by current server
     /// state, it is a stale message and should be just ignored.
     fn does_replication_session_match(
