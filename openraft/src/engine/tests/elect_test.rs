@@ -387,3 +387,31 @@ fn test_elect_multi_node_enter_candidate() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_elect_campaigns_above_a_rejected_stale_candidate() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.config.id = 1;
+    eng.state
+        .membership_state
+        .set_effective(Arc::new(EffectiveMembership::new(Some(log_id(0, 1, 1)), m12())));
+    eng.state.log_ids = LogIdList::new(vec![log_id(1, 1, 1)]);
+    eng.stale_candidate = Some(crate::engine::engine_impl::StaleCandidate {
+        term: 4,
+        rejected_at: crate::TokioInstant::now(),
+    });
+
+    eng.elect();
+
+    // The stale candidate voted for itself in term 4, so a campaign in term 1 or 4 could not win
+    // its vote.
+    assert_eq!(Vote::new(5, 1), *eng.state.vote_ref());
+    assert!(eng.stale_candidate.is_none(), "the campaign consumes the record");
+    assert_eq!(
+        vec![Command::SaveVote { vote: Vote::new(5, 1) }, Command::SendVote {
+            vote_req: VoteRequest::new(Vote::new(5, 1), Some(log_id(1, 1, 1)))
+        },],
+        eng.output.take_commands()
+    );
+    Ok(())
+}

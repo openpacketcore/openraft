@@ -43,6 +43,7 @@ use crate::raft::VoteResponse;
 use crate::raft_state::LogStateReader;
 use crate::raft_state::RaftState;
 use crate::summary::MessageSummary;
+use crate::type_config::alias::InstantOf;
 use crate::type_config::alias::ResponderOf;
 use crate::type_config::alias::SnapshotDataOf;
 use crate::type_config::TypeConfigExt;
@@ -55,6 +56,18 @@ use crate::RaftTypeConfig;
 use crate::Snapshot;
 use crate::SnapshotMeta;
 use crate::Vote;
+
+/// A candidate whose vote request this node rejected because its log was behind; see
+/// `Engine::stale_candidate`.
+#[derive(Debug, Clone)]
+pub(crate) struct StaleCandidate<C>
+where C: RaftTypeConfig
+{
+    /// The highest term among such rejected requests.
+    pub(crate) term: u64,
+    /// When the first of them was rejected.
+    pub(crate) rejected_at: InstantOf<C>,
+}
 
 /// Raft protocol algorithm.
 ///
@@ -97,6 +110,18 @@ where C: RaftTypeConfig
     /// persisted, and it is dropped once a real election starts or this node follows another vote.
     pub(crate) pre_candidate: CandidateState<C>,
 
+    /// A candidate whose vote request this node rejected because that candidate's log was behind
+    /// this node's, recorded only while this node has no leader.
+    ///
+    /// Such a candidate cannot win against this node's log. When it is a voter that cannot answer
+    /// Pre-Vote, as a voter of a release without Pre-Vote cannot, this node's own Pre-Vote may
+    /// never reach a quorum either. If no leader appears for one election timeout after the
+    /// first rejection, this node campaigns without Pre-Vote, in a term above every rejected
+    /// candidate's. The wait lets such a candidate still win with the other voters' grants
+    /// without being disrupted. Hearing from a leader, granting a vote, leading or campaigning
+    /// clears it.
+    pub(crate) stale_candidate: Option<StaleCandidate<C>>,
+
     /// Retirement is irreversible for this engine instance, including after a new vote.
     pub(crate) prepared_shutdown: Option<PreparedShutdown<C::NodeId>>,
 
@@ -118,6 +143,7 @@ where C: RaftTypeConfig
             leader: None,
             candidate: None,
             pre_candidate: None,
+            stale_candidate: None,
             prepared_shutdown: None,
             output: EngineOutput::new(4096),
         }
@@ -267,7 +293,10 @@ where C: RaftTypeConfig
             self.leader.as_ref().map(|l| l.vote.to_string()).unwrap_or_default()
         );
 
-        let new_term = self.state.vote.leader_id().term + 1;
+        // Campaign above every candidate this node rejected for its log, so that such a candidate's
+        // vote for itself in a term cannot block this campaign.
+        let stale_term = self.stale_candidate.take().map_or(0, |stale| stale.term);
+        let new_term = std::cmp::max(self.state.vote.leader_id().term, stale_term) + 1;
         let new_vote = Vote::new(new_term, self.config.id.clone());
 
         let candidate = self.new_candidate(new_vote.clone());
@@ -437,6 +466,16 @@ where C: RaftTypeConfig
             // The res is not used yet.
             // let _res = Err(RejectVoteRequest::ByLastLogId(self.state.last_log_id().copied()));
 
+            // This node has no leader: its lease has expired, and it does not lead. Remember the
+            // candidate, which cannot win against this node's log; see `stale_candidate`.
+            let term = req.vote.leader_id().term;
+            match self.stale_candidate.as_mut() {
+                Some(stale) => stale.term = std::cmp::max(stale.term, term),
+                None => {
+                    self.stale_candidate = Some(StaleCandidate { term, rejected_at: now });
+                }
+            }
+
             // Return the updated vote, this way the candidate knows which vote is granted, in case
             // the candidate's vote is changed after sending the vote request.
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
@@ -445,6 +484,10 @@ where C: RaftTypeConfig
         // Then check vote just as it does for every incoming event.
 
         let res = self.vote_handler().update_vote(&req.vote);
+        if res.is_ok() {
+            // A granted vote follows another candidate.
+            self.stale_candidate = None;
+        }
 
         tracing::info!(
             req = display(req.summary()),
@@ -670,7 +713,8 @@ where C: RaftTypeConfig
     ) -> Result<(), RejectAppendEntries<C::NodeId>> {
         self.vote_handler().update_vote(vote)?;
 
-        // Vote is legal.
+        // Vote is legal: this node hears from a leader.
+        self.stale_candidate = None;
 
         let mut fh = self.following_handler();
         fh.ensure_log_consecutive(prev_log_id.clone())?;
@@ -873,6 +917,7 @@ where C: RaftTypeConfig
 
         // An overlapping Pre-Vote round must not start another campaign once this node leads.
         self.pre_candidate = None;
+        self.stale_candidate = None;
 
         let candidate = self.candidate.take().unwrap();
         let leader = self.establish_handler().establish(candidate);
@@ -931,6 +976,12 @@ where C: RaftTypeConfig
         } else {
             Ok(())
         }
+    }
+
+    /// Whether this node campaigns without Pre-Vote now, after rejecting a stale candidate at
+    /// least `wait` ago and hearing from no leader since; see `stale_candidate`.
+    pub(crate) fn stale_candidate_campaign_due(&self, now: InstantOf<C>, wait: Duration) -> bool {
+        self.stale_candidate.as_ref().is_some_and(|stale| now >= stale.rejected_at + wait)
     }
 
     pub(crate) fn is_there_greater_log(&self) -> bool {
