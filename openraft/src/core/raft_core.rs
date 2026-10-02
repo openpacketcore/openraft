@@ -1751,26 +1751,21 @@ where
 
         if pre_vote {
             // A Pre-Vote round does not update the vote, so the expired election timer would
-            // restart it on every tick. Keep a round in flight for the width of the
-            // election-timeout window, then retry it on a later tick.
+            // restart it on every tick. A round that awaits replies no voter has rejected stays the
+            // latest until they are due, one Pre-Vote deadline after it started: a slow reply must
+            // still reach it. A rejected round is retried after the width of the election-timeout
+            // window, while it stays open for late grants.
             //
             // After an unplanned leader loss, a round fails while a voter's lease still runs, and
             // every lease runs out within the minimum election timeout of the loss. A survivor's
             // first round starts within the maximum election timeout and a tick of its last leader
-            // contact, and each retry within the window's width and a tick of the round before.
-            // So the survivor with the most up-to-date log starts a round that no lease rejects
-            // within the maximum election timeout and a tick of the loss. Holding a rejected round
-            // for a whole sampled election timeout could double that.
-            let engine_config = &self.engine.config;
-            let round_timeout = Duration::from_millis(
-                engine_config.election_timeout_max.saturating_sub(engine_config.election_timeout_min),
-            );
-
-            if let Some(started) = self.engine.pre_candidate_ref().map(|x| x.starting_time()) {
-                if now < started + round_timeout {
-                    tracing::debug!("a Pre-Vote round is already in flight");
-                    return;
-                }
+            // contact. When every surviving voter answers within the window's width, each retry
+            // starts within that width and a tick of the round before, so the survivor with the
+            // most up-to-date log starts a round that no lease rejects within the maximum election
+            // timeout and a tick of the loss.
+            if !self.engine.pre_vote_round_due(now) {
+                tracing::debug!("a Pre-Vote round is already in flight");
+                return;
             }
         }
 

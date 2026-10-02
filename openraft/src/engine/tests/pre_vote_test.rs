@@ -188,7 +188,7 @@ fn test_handle_pre_vote_resp_quorum_starts_real_election() -> anyhow::Result<()>
 
     eng.handle_pre_vote_resp(
         3,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(
             Vote::new_committed(1, 2),
             Some(log_id(1, 2, 3)),
@@ -226,7 +226,7 @@ fn test_handle_pre_vote_resp_rejection_keeps_waiting() -> anyhow::Result<()> {
 
     eng.handle_pre_vote_resp(
         3,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(
             Vote::new_committed(1, 2),
             Some(log_id(1, 2, 3)),
@@ -243,7 +243,7 @@ fn test_handle_pre_vote_resp_rejection_keeps_waiting() -> anyhow::Result<()> {
     tracing::info!("--- a rejection that reports a greater log delays the next campaign");
     eng.handle_pre_vote_resp(
         2,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(
             Vote::new_committed(1, 2),
             Some(log_id(1, 2, 5)),
@@ -265,7 +265,7 @@ fn test_handle_pre_vote_resp_rejection_adopts_a_higher_vote() -> anyhow::Result<
 
     eng.handle_pre_vote_resp(
         3,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(
             Vote::new_committed(5, 3),
             Some(log_id(1, 2, 3)),
@@ -292,7 +292,7 @@ fn test_handle_pre_vote_resp_rejection_with_equal_vote_keeps_the_round() -> anyh
 
     eng.handle_pre_vote_resp(
         3,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(vote_before, Some(log_id(1, 2, 3)), false)),
     );
 
@@ -322,7 +322,7 @@ fn test_accepted_vote_ends_the_pre_vote_round() -> anyhow::Result<()> {
     // A delayed grant for the ended round starts nothing.
     eng.handle_pre_vote_resp(
         3,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(leader_vote, Some(log_id(1, 2, 3)), true)),
     );
     assert!(eng.candidate_ref().is_none());
@@ -354,7 +354,7 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     eng.pre_elect();
     eng.handle_pre_vote_resp(
         2,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(
             Vote::new_committed(1, 2),
             Some(log_id(1, 2, 3)),
@@ -378,7 +378,7 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     // A delayed grant for round B starts no campaign on the leader.
     eng.handle_pre_vote_resp(
         2,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 2, 3)), true)),
     );
     assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
@@ -443,7 +443,7 @@ fn test_handle_pre_vote_resp_rejection_never_adopts_a_vote_for_this_node() -> an
     // node in a term it never campaigned in.
     eng.handle_pre_vote_resp(
         3,
-        eng.pre_vote_round,
+        eng.pre_vote_rounds.latest_id(),
         PreVoteReply::Answered(VoteResponse::new(proposed, None, false)),
     );
 
@@ -467,7 +467,7 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
     let mut eng = eng(m123());
     eng.pre_elect();
     eng.output.take_commands();
-    let first_round = eng.pre_vote_round;
+    let first_round = eng.pre_vote_rounds.latest_id();
     let first_round_vote = *eng.pre_candidate_ref().unwrap().vote_ref();
 
     // Leader 2 replicates a membership without voter 3 in its unchanged term, which ends the round.
@@ -486,7 +486,11 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
         *eng.pre_candidate_ref().unwrap().vote_ref(),
         "both rounds propose the same vote"
     );
-    assert_ne!(first_round, eng.pre_vote_round, "each round has its own identifier");
+    assert_ne!(
+        first_round,
+        eng.pre_vote_rounds.latest_id(),
+        "each round has its own identifier"
+    );
 
     // Voter 3's grant for the first round arrives now.
     let grant = VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true);
@@ -502,7 +506,7 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
     assert_eq!(0, eng.output.take_commands().len());
 
     // Even a grant that names the new round cannot count for a node outside its quorum set.
-    eng.handle_pre_vote_resp(3, eng.pre_vote_round, PreVoteReply::Answered(grant));
+    eng.handle_pre_vote_resp(3, eng.pre_vote_rounds.latest_id(), PreVoteReply::Answered(grant));
 
     assert!(eng.pre_candidate_ref().is_some(), "the new round keeps waiting");
     assert_eq!(
@@ -525,7 +529,7 @@ fn test_unsupported_pre_vote_runs_the_classic_election() -> anyhow::Result<()> {
     eng.pre_elect();
     eng.output.take_commands();
 
-    eng.handle_pre_vote_resp(3, eng.pre_vote_round, PreVoteReply::Unsupported);
+    eng.handle_pre_vote_resp(3, eng.pre_vote_rounds.latest_id(), PreVoteReply::Unsupported);
 
     assert!(eng.pre_candidate_ref().is_none(), "the classic election ends the round");
     assert_eq!(
@@ -554,20 +558,175 @@ fn test_unsupported_pre_vote_of_an_ended_round_or_a_non_voter_starts_nothing() -
     let vote_before = *eng.state.vote_ref();
 
     // Node 3 is not a voter.
-    eng.handle_pre_vote_resp(3, eng.pre_vote_round, PreVoteReply::Unsupported);
+    eng.handle_pre_vote_resp(3, eng.pre_vote_rounds.latest_id(), PreVoteReply::Unsupported);
     assert!(eng.pre_candidate_ref().is_some(), "the round keeps waiting");
 
     // A reply to an earlier round.
-    eng.handle_pre_vote_resp(2, eng.pre_vote_round - 1, PreVoteReply::Unsupported);
+    eng.handle_pre_vote_resp(2, eng.pre_vote_rounds.latest_id() - 1, PreVoteReply::Unsupported);
     assert!(eng.pre_candidate_ref().is_some(), "the round keeps waiting");
 
     // A reply after a heartbeat ended the round.
     eng.vote_handler().update_vote(&vote_before)?;
-    eng.handle_pre_vote_resp(2, eng.pre_vote_round, PreVoteReply::Unsupported);
+    eng.handle_pre_vote_resp(2, eng.pre_vote_rounds.latest_id(), PreVoteReply::Unsupported);
 
     assert!(eng.candidate_ref().is_none(), "no election starts");
     assert_eq!(vote_before, *eng.state.vote_ref());
     assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+/// A follower of node 2 whose election-timeout window, 100 ms wide, is shorter than the 1,000 ms
+/// Pre-Vote deadline.
+fn eng_with_window(membership: Membership<u64, ()>) -> Engine<UTConfig> {
+    let mut eng = eng(membership);
+    eng.config.election_timeout_min = 1_000;
+    eng.config.election_timeout_max = 1_100;
+    eng
+}
+
+fn window_and_deadline(eng: &Engine<UTConfig>) -> (Duration, Duration) {
+    (
+        Duration::from_millis(eng.config.election_timeout_max - eng.config.election_timeout_min),
+        Duration::from_millis(eng.config.election_timeout_min),
+    )
+}
+
+/// A round that awaits replies no voter rejected stays the latest until they are due: a slow
+/// reply that arrives after the election-timeout window must still reach it.
+#[test]
+fn test_unanswered_round_stays_open_until_its_replies_are_due() -> anyhow::Result<()> {
+    let mut eng = eng_with_window(m123());
+    let (window, deadline) = window_and_deadline(&eng);
+    eng.pre_elect();
+    eng.output.take_commands();
+    let round = eng.pre_vote_rounds.latest_id();
+    let started = eng.pre_candidate_ref().unwrap().starting_time();
+
+    assert!(!eng.pre_vote_round_due(started + window + Duration::from_millis(1)));
+    assert!(!eng.pre_vote_round_due(started + deadline - Duration::from_millis(1)));
+
+    // A grant within the deadline still counts.
+    eng.handle_pre_vote_resp(
+        3,
+        round,
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            true,
+        )),
+    );
+    assert_eq!(Vote::new(2, 1), *eng.state.vote_ref(), "the real election starts");
+    assert!(eng.pre_vote_rounds.is_empty());
+
+    Ok(())
+}
+
+/// The replies to a round are due one Pre-Vote deadline after it started; the round then closes.
+#[test]
+fn test_round_closes_when_its_replies_are_due() -> anyhow::Result<()> {
+    let mut eng = eng_with_window(m123());
+    let (_window, deadline) = window_and_deadline(&eng);
+    eng.pre_elect();
+    eng.output.take_commands();
+    let round = eng.pre_vote_rounds.latest_id();
+    let started = eng.pre_candidate_ref().unwrap().starting_time();
+
+    assert!(eng.pre_vote_round_due(started + deadline));
+    assert!(eng.pre_vote_rounds.is_empty(), "the round closed");
+
+    // A grant that could no longer arrive in time starts nothing.
+    let vote_before = *eng.state.vote_ref();
+    eng.handle_pre_vote_resp(
+        3,
+        round,
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            true,
+        )),
+    );
+    assert_eq!(vote_before, *eng.state.vote_ref());
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+/// A rejected round may be retried after the window's width, and it stays open: a late grant
+/// still completes it.
+#[test]
+fn test_rejected_round_is_retried_after_the_window_and_still_counts_late_grants() -> anyhow::Result<()> {
+    let mut eng = eng_with_window(m123());
+    let (window, _deadline) = window_and_deadline(&eng);
+    eng.pre_elect();
+    eng.output.take_commands();
+    let first_round = eng.pre_vote_rounds.latest_id();
+    let started = eng.pre_candidate_ref().unwrap().starting_time();
+
+    // Voter 2 still serves the lost leader and rejects.
+    eng.handle_pre_vote_resp(
+        2,
+        first_round,
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            false,
+        )),
+    );
+    assert!(!eng.pre_vote_round_due(started + window - Duration::from_millis(1)));
+    assert!(eng.pre_vote_round_due(started + window));
+
+    eng.pre_elect();
+    eng.output.take_commands();
+    assert_ne!(first_round, eng.pre_vote_rounds.latest_id(), "a new round started");
+    assert_eq!(2, eng.pre_vote_rounds.len(), "the rejected round stays open");
+
+    // Voter 3's slow grant for the first round completes it.
+    eng.handle_pre_vote_resp(
+        3,
+        first_round,
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            true,
+        )),
+    );
+    assert_eq!(Vote::new(2, 1), *eng.state.vote_ref(), "the real election starts");
+    assert!(eng.candidate_ref().is_some());
+    assert!(eng.pre_vote_rounds.is_empty(), "the election ends every round");
+
+    Ok(())
+}
+
+/// A voter reported as unable to answer Pre-Vote after a newer round started still makes this
+/// node run the classic election.
+#[test]
+fn test_late_unsupported_for_an_open_round_runs_the_classic_election() -> anyhow::Result<()> {
+    let mut eng = eng_with_window(m123());
+    let (window, _deadline) = window_and_deadline(&eng);
+    eng.pre_elect();
+    eng.output.take_commands();
+    let first_round = eng.pre_vote_rounds.latest_id();
+    let started = eng.pre_candidate_ref().unwrap().starting_time();
+
+    eng.handle_pre_vote_resp(
+        2,
+        first_round,
+        PreVoteReply::Answered(VoteResponse::new(
+            Vote::new_committed(1, 2),
+            Some(log_id(1, 2, 3)),
+            false,
+        )),
+    );
+    assert!(eng.pre_vote_round_due(started + window));
+    eng.pre_elect();
+    eng.output.take_commands();
+
+    eng.handle_pre_vote_resp(3, first_round, PreVoteReply::Unsupported);
+
+    assert_eq!(Vote::new(2, 1), *eng.state.vote_ref(), "the classic election starts");
+    assert!(eng.candidate_ref().is_some());
+    assert!(eng.pre_vote_rounds.is_empty());
 
     Ok(())
 }

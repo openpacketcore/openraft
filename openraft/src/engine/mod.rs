@@ -34,6 +34,7 @@ mod engine_impl;
 mod engine_output;
 mod leadership_transfer;
 mod log_id_list;
+pub(crate) mod pre_vote_rounds;
 
 pub(crate) mod handler;
 pub(crate) mod time_state;
