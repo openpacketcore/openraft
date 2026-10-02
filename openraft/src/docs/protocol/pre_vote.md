@@ -31,11 +31,20 @@ with more than one voter sends a Pre-Vote request to the other voters: *would
 you grant me a vote at `term + 1`?* The request carries that hypothetical vote
 and the voter's last log id.
 
+The round starts only when the voter's own leader lease has expired: while it
+is valid, a leader is serving the voter and every voter applying the same rule
+would reject the round.
+
 A voter answers with the rules it uses for a real vote request:
 
 - If it holds a committed vote whose
   [leader lease](`crate::docs::protocol::replication::leader_lease`) has not
   expired, it would not grant: a leader is serving it.
+- If it is the leader and a quorum acknowledged it within the leader lease, it
+  would not grant. A leader never renews the lease on its own vote, because
+  acknowledgements renew it only on followers, so it uses this
+  quorum-acknowledged lease instead. A real vote request is judged the same
+  way, except that a planned leadership transfer releases the lease.
 - If the requester's last log id is behind its own, it would not grant.
 - If the requested vote is not greater than or equal to its own vote, it would
   not grant.

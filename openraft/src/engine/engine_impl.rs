@@ -299,6 +299,18 @@ where C: RaftTypeConfig
             return;
         }
 
+        // A voter that a live leader serves does not start a round: every voter applying the same
+        // lease rule would reject it. Return before sampling a new timeout so nothing changes.
+        let lease = self.config.timer_config.leader_lease;
+        if self.state.vote_ref().is_committed() && !self.state.vote.lease_disabled() {
+            if let Some(utime) = self.state.vote_last_modified() {
+                if C::now() <= utime + lease {
+                    tracing::info!("skip pre-elect: the leader lease has not yet expired");
+                    return;
+                }
+            }
+        }
+
         // A Pre-Vote does not advance the persisted vote timestamp, so a new round is gated by a
         // newly sampled timeout, as a real campaign is.
         self.config.resample_election_timeout::<C::AsyncRuntime>();
@@ -400,6 +412,18 @@ where C: RaftTypeConfig
             }
         }
 
+        // A leader does not renew the lease on its own vote. While a quorum keeps acknowledging it,
+        // it rejects other candidates as its followers do. A planned leadership transfer releases
+        // this vote's lease, and its successor's vote is granted.
+        if !self.state.vote.lease_disabled() {
+            if let Some(leader) = self.leader.as_mut() {
+                if leader.is_lease_valid(now, lease) {
+                    tracing::info!("reject vote-request: the quorum-acknowledged leader lease has not yet expired");
+                    return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+                }
+            }
+        }
+
         // The first step is to check log. If the candidate has less log, nothing needs to be done.
 
         if req.last_log_id.as_ref() >= self.state.last_log_id() {
@@ -458,6 +482,16 @@ where C: RaftTypeConfig
         if vote.is_committed() && !self.state.vote.lease_disabled() && now <= vote_utime + lease {
             tracing::info!("reject pre-vote-request: leader lease has not yet expired");
             return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+        }
+
+        // Nor would a leader that a quorum keeps acknowledging.
+        if !self.state.vote.lease_disabled() {
+            if let Some(leader) = self.leader.as_mut() {
+                if leader.is_lease_valid(now, lease) {
+                    tracing::info!("reject pre-vote-request: the quorum-acknowledged leader lease has not yet expired");
+                    return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+                }
+            }
         }
 
         if req.last_log_id.as_ref() >= self.state.last_log_id() {

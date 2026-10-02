@@ -55,7 +55,9 @@ For an uncommitted vote (the vote that is saved upon receiving a `VoteRequest`):
 
 For a committed vote (the vote that is saved upon receiving `AppendEntriesRequest` or `InstallSnapshotRequest`):
 
-- The node **WILL NOT** handle a `VoteRequest` before the `leader_lease` expires;
+- The node **WILL NOT** handle a `VoteRequest` before the `leader_lease` expires.
+  A leader does not renew the lease on its own vote; it rejects a `VoteRequest`
+  while a quorum acknowledged it within the `leader_lease` instead;
 - The node **WILL NOT** elect itself until both the `leader_lease` and the
   `election_timeout` have expired. Both start at `Vote.last_update_time` and run
   in parallel, so the node waits for the longer of the two, not for their sum.

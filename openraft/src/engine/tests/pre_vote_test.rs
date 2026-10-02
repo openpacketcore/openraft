@@ -10,6 +10,7 @@ use crate::engine::testing::UTConfig;
 use crate::engine::Command;
 use crate::engine::Engine;
 use crate::engine::LogIdList;
+use crate::progress::Progress;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::testing::log_id;
@@ -343,6 +344,48 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     eng.handle_pre_vote_resp(2, VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 2, 3)), true));
     assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
     assert_eq!(ServerState::Leader, eng.state.server_state);
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+#[test]
+fn test_pre_elect_refused_while_the_leader_lease_is_valid() -> anyhow::Result<()> {
+    let mut eng = eng(m123());
+    // A follower that its leader served just now.
+    eng.state.vote.update(TokioInstant::now(), Vote::new_committed(1, 2));
+    let timeout_before = eng.config.timer_config.election_timeout;
+    let vote_before = *eng.state.vote_ref();
+
+    eng.pre_elect();
+
+    // Refused before it changes anything, including the sampled timeout.
+    assert!(eng.pre_candidate_ref().is_none());
+    assert!(eng.candidate_ref().is_none());
+    assert_eq!(vote_before, *eng.state.vote_ref());
+    assert_eq!(timeout_before, eng.config.timer_config.election_timeout);
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_pre_vote_req_rejected_by_quorum_acknowledged_lease() -> anyhow::Result<()> {
+    let mut eng = eng(m123());
+    // A leader whose own vote is no longer leased, acknowledged by node 2 just now.
+    eng.state.vote = UTime::new(TokioInstant::now() - Duration::from_secs(1), Vote::new_committed(2, 1));
+    eng.testing_new_leader().clock_progress.increase_to(&2, Some(TokioInstant::now())).unwrap();
+    eng.state.server_state = ServerState::Leader;
+    let vote_before = *eng.state.vote_ref();
+
+    let resp = eng.handle_pre_vote_req(VoteRequest::new(Vote::new(3, 3), Some(log_id(1, 2, 3))));
+
+    assert_eq!(
+        VoteResponse::new(Vote::new_committed(2, 1), Some(log_id(1, 2, 3)), false),
+        resp
+    );
+    assert_eq!(vote_before, *eng.state.vote_ref());
+    assert!(eng.leader.is_some(), "the leader keeps leading");
     assert_eq!(0, eng.output.take_commands().len());
 
     Ok(())

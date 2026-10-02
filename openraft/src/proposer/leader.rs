@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use crate::display_ext::DisplaySliceExt;
 use crate::progress::entry::ProgressEntry;
@@ -182,6 +183,16 @@ where
     /// Note that the leader may not be in the QuorumSet at all.
     /// In such a case, the update operation will be just ignored,
     /// and the quorum-acked-time is totally determined by remove voters.
+    /// Whether a quorum acknowledged this leader within the last `lease` before `now`.
+    ///
+    /// A leader never renews the lease on its own vote: AppendEntries acknowledgements renew it
+    /// only on followers. Each follower that acknowledged an AppendEntries sent at `t` received it
+    /// no earlier than `t`, so it rejects other candidates until at least `t + lease`. While a
+    /// quorum has acknowledged this leader within `lease`, this is the leader's live lease.
+    pub(crate) fn is_lease_valid(&mut self, now: InstantOf<C>, lease: Duration) -> bool {
+        self.last_quorum_acked_time().is_some_and(|acked| now < acked + lease)
+    }
+
     pub(crate) fn last_quorum_acked_time(&mut self) -> Option<InstantOf<C>> {
         // For `Leading`, the vote is always the leader's vote.
         // Thus vote.voted_for() is this node.

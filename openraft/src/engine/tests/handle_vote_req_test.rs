@@ -9,6 +9,7 @@ use crate::engine::testing::UTConfig;
 use crate::engine::Command;
 use crate::engine::Engine;
 use crate::engine::LogIdList;
+use crate::progress::Progress;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::testing::log_id;
@@ -57,6 +58,74 @@ fn test_handle_vote_req_rejected_by_leader_lease() -> anyhow::Result<()> {
 
     assert_eq!(ServerState::Candidate, eng.state.server_state);
     assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+/// A leader of `{0,1}` whose own vote is no longer leased, and which node 0 acknowledged just now.
+fn acknowledged_leader() -> Engine<UTConfig> {
+    let mut eng = eng();
+    eng.candidate = None;
+    eng.state.vote = UTime::new(TokioInstant::now() - Duration::from_secs(1), Vote::new_committed(2, 1));
+    eng.testing_new_leader().clock_progress.increase_to(&0, Some(TokioInstant::now())).unwrap();
+    eng.state.server_state = ServerState::Leader;
+    eng.output.take_commands();
+    eng
+}
+
+#[test]
+fn test_handle_vote_req_rejected_by_quorum_acknowledged_lease() -> anyhow::Result<()> {
+    let mut eng = acknowledged_leader();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(3, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert_eq!(VoteResponse::new(Vote::new_committed(2, 1), None, false), resp);
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert!(eng.leader.is_some(), "the leader keeps leading");
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_vote_req_planned_transfer_overrides_quorum_acknowledged_lease() -> anyhow::Result<()> {
+    let mut eng = acknowledged_leader();
+    // A planned handoff releases the lease of the retiring vote.
+    eng.state.vote.disable_lease();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(3, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert_eq!(VoteResponse::new(Vote::new(3, 0), None, true), resp);
+    assert_eq!(Vote::new(3, 0), *eng.state.vote_ref());
+    assert!(eng.leader.is_none(), "granting the successor ends this leadership");
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_vote_req_granted_once_the_quorum_acknowledged_lease_expires() -> anyhow::Result<()> {
+    let mut eng = acknowledged_leader();
+    let expired = TokioInstant::now() - eng.config.timer_config.leader_lease - Duration::from_millis(1);
+    eng.leader.as_mut().unwrap().clock_progress = crate::progress::VecProgress::new(
+        eng.state.membership_state.effective().membership().to_quorum_set(),
+        [],
+        None,
+    );
+    eng.leader.as_mut().unwrap().clock_progress.increase_to(&0, Some(expired)).unwrap();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(3, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert_eq!(VoteResponse::new(Vote::new(3, 0), None, true), resp);
+    assert!(eng.leader.is_none());
 
     Ok(())
 }
