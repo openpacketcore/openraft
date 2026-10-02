@@ -1632,11 +1632,9 @@ where
             let utime = self.engine.state.vote_last_modified();
             let timer_config = &self.engine.config.timer_config;
 
-            let mut election_timeout = if current_vote.is_committed() {
-                timer_config.leader_lease + timer_config.election_timeout
-            } else {
-                timer_config.election_timeout
-            };
+            // The leader lease and the sampled election timeout run in parallel from the last
+            // update of a committed vote: campaign after the longer of the two.
+            let mut election_timeout = timer_config.election_wait(current_vote.is_committed());
 
             if self.engine.is_there_greater_log() {
                 election_timeout += timer_config.smaller_log_timeout;
