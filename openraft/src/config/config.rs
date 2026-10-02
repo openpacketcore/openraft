@@ -128,6 +128,17 @@ pub struct Config {
     #[clap(long, default_value = "50")]
     pub heartbeat_interval: u64,
 
+    /// The deadline of one AppendEntries RPC in milliseconds.
+    ///
+    /// It bounds every AppendEntries RPC a leader sends: log replication, heartbeats and the
+    /// heartbeats that confirm leadership for a linearizable read. Heartbeats are still sent every
+    /// `heartbeat_interval`, so a follower may take longer than one heartbeat interval to answer
+    /// without its request being abandoned and resent. It must be positive.
+    ///
+    /// When unset, the deadline is `heartbeat_interval`.
+    #[clap(long)]
+    pub append_entries_timeout: Option<u64>,
+
     /// The timeout for sending then installing the last snapshot segment,
     /// in millisecond. It is also used as the timeout for sending a non-last segment, if
     /// `send_snapshot_timeout` is 0.
@@ -270,6 +281,14 @@ impl Config {
     /// Generate a new random election timeout within the configured min & max.
     pub fn new_rand_election_timeout<RT: AsyncRuntime>(&self) -> u64 {
         RT::thread_rng().gen_range(self.election_timeout_min..self.election_timeout_max)
+    }
+
+    /// Get the deadline of one AppendEntries RPC.
+    ///
+    /// It is [`append_entries_timeout`](Self::append_entries_timeout) when set, otherwise
+    /// [`heartbeat_interval`](Self::heartbeat_interval).
+    pub fn append_entries_timeout(&self) -> Duration {
+        Duration::from_millis(self.append_entries_timeout.unwrap_or(self.heartbeat_interval))
     }
 
     /// Get the timeout for sending and installing the last snapshot segment.

@@ -274,6 +274,9 @@ pub struct TypedRaftRouter {
 
     /// Targets whose AppendEntries RPC never returns, emulating a hung follower.
     blocked_rpc: Arc<Mutex<BTreeSet<MemNodeId>>>,
+
+    /// The target and hard deadline of every AppendEntries RPC, in the order they are sent.
+    append_entries_deadlines: Arc<Mutex<Vec<(MemNodeId, Duration)>>>,
 }
 
 /// Default `RaftRouter` for memstore.
@@ -312,6 +315,7 @@ impl Builder {
             rpc_pre_hook: Default::default(),
             rpc_observers: Default::default(),
             blocked_rpc: Default::default(),
+            append_entries_deadlines: Default::default(),
         }
     }
 }
@@ -377,6 +381,11 @@ impl TypedRaftRouter {
 
     pub fn get_rpc_count(&self) -> HashMap<RPCTypes, u64> {
         self.rpc_count.lock().unwrap().clone()
+    }
+
+    /// The target and hard deadline of every AppendEntries RPC sent so far, in sending order.
+    pub fn append_entries_deadlines(&self) -> Vec<(MemNodeId, Duration)> {
+        self.append_entries_deadlines.lock().unwrap().clone()
     }
 
     /// Create a cluster: 0 is the initial leader, others are voters and learners
@@ -1051,11 +1060,12 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
     async fn append_entries(
         &mut self,
         mut rpc: AppendEntriesRequest<MemConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
         let from_id = rpc.vote.leader_id().voted_for().unwrap();
 
         tracing::debug!("append_entries to id={} {}", self.target, rpc.summary());
+        self.owner.append_entries_deadlines.lock().unwrap().push((self.target, option.hard_ttl()));
         self.owner.count_rpc(RPCTypes::AppendEntries);
         self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
         self.owner.emit_rpc_error(from_id, self.target)?;

@@ -99,6 +99,24 @@ fn test_build() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_config_append_entries_timeout() -> anyhow::Result<()> {
+    let config = Config::build(&["foo", "--heartbeat-interval=40"])?;
+    assert_eq!(None, config.append_entries_timeout);
+    assert_eq!(
+        Duration::from_millis(40),
+        config.append_entries_timeout(),
+        "by default an AppendEntries RPC is bounded by the heartbeat interval"
+    );
+
+    let config = Config::build(&["foo", "--heartbeat-interval=40", "--append-entries-timeout=900"])?;
+    assert_eq!(Some(900), config.append_entries_timeout);
+    assert_eq!(Duration::from_millis(900), config.append_entries_timeout());
+    assert_eq!(40, config.heartbeat_interval);
+
+    Ok(())
+}
+
+#[test]
 fn test_config_snapshot_policy() -> anyhow::Result<()> {
     let config = Config::build(&["foo", "--snapshot-policy=never"])?;
     assert_eq!(SnapshotPolicy::Never, config.snapshot_policy);
