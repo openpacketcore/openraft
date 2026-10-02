@@ -60,10 +60,13 @@ term and persists its vote as usual. A response with a strictly higher vote
 catches the requester up to that vote in non-committed form, as a rejected real
 vote does, unless it is a vote for the requester itself: no voter holds one for
 a term the requester never campaigned in. A rejection that reports a greater
-log delays the next attempt. Any
-vote the requester accepts afterwards, including a heartbeat from the current
-leader, ends the round. Otherwise the round is retried after one newly sampled
-election timeout.
+log delays the next attempt. Any vote the requester accepts afterwards,
+including a heartbeat from the current leader, ends the round.
+
+Each round has its own identifier, which every response names. Rounds in one
+term propose the same hypothetical vote, so the vote cannot tell a delayed
+response from a current one; a response to any round but the one in flight is
+ignored. A grant from a node that does not vote in the round never counts.
 
 Only a response counts toward the quorum. An error, including an unreachable
 peer, is never a grant, so a voter that is cut off cannot assemble one.
@@ -71,40 +74,53 @@ peer, is never a grant, so a voter that is cut off cannot assemble one.
 A voter that is the only voter wins its own Pre-Vote and elects at once.
 
 
+## Retrying a round
+
+A round that has not reached a quorum is held for the width of the
+election-timeout window, `election_timeout_max - election_timeout_min`, and
+then retried on a later tick while the election timer stays expired.
+
+After an unplanned leader loss, a round fails while another voter's lease
+still runs. Every survivor's lease runs out within the minimum election timeout
+of the loss. A survivor starts its first round within the maximum election
+timeout and a tick of its last leader contact, and each retry within the
+window's width and a tick of the round before it. So the survivor with the most
+up-to-date log starts a round that no lease rejects within the maximum election
+timeout and a tick of the loss, the same bound as its first round. Holding a
+rejected round for a whole sampled election timeout instead could nearly double
+that.
+
+
 ## Voters that cannot answer Pre-Vote
 
 A network may reach voters that cannot answer a Pre-Vote request, such as
 voters of a release without Pre-Vote during a rolling upgrade. Such a voter
-campaigns with the real vote alone and grants real votes by the rules above. A
-network that knows a voter is one of them answers its Pre-Vote locally, as a
-rejection that carries no vote to catch up to, and never sends it a request it
-could not decode.
+campaigns with the real vote alone and grants real votes by the rules above,
+but it can never grant a Pre-Vote. Pre-Vote is therefore used only while every
+voter that can be reached is positively known to answer it:
 
-Counting such a voter as rejecting keeps a voter that runs Pre-Vote from
-campaigning, and raising its term, before a voter without Pre-Vote that may
-hold a more up-to-date log campaigns. That voter then wins with the real vote.
-When its log is behind, it cannot win, and a voter whose log is more up to date
-must campaign instead, although its own Pre-Vote may never reach a quorum:
+- [`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) sends the
+  request and returns [`PreVoteReply::Answered`](`crate::raft::PreVoteReply`)
+  only for a target that is positively known to answer Pre-Vote: the
+  capability was negotiated on the connection to it, or it is an in-process
+  peer that passes the request to
+  [`Raft::pre_vote`](`crate::Raft::pre_vote`).
+- For any other target that it can reach, it sends nothing and returns
+  [`PreVoteReply::Unsupported`](`crate::raft::PreVoteReply`). The voter then
+  ends the round and runs the classic election for this campaign at once:
+  waiting for a Pre-Vote quorum that needs that target could take forever, for
+  example when the target still believes it leads and never campaigns itself.
+- A target that cannot be reached is an error. It can grant neither a Pre-Vote
+  nor a vote, so it neither counts as a grant nor forces the classic election.
 
-- A voter that rejects a real vote request because the candidate's log is
-  behind its own, while it has no leader, records that candidate's term.
-- If it hears from no leader for one election timeout after the first such
-  rejection, it campaigns without Pre-Vote, in a term above every recorded
-  term. The candidate voted for itself in its own term, so a campaign in that
-  term could not win its vote.
-- The wait lets that candidate still win with the other voters' grants, without
-  being disrupted.
-- Hearing from a leader, granting a vote, leading or campaigning clears the
-  record.
-
-The rule changes no vote rule: a voter still grants only a candidate whose log
-is at least as up to date as its own. It only decides when a voter campaigns.
+Each campaign decides again, so a voter set that no longer holds such a voter
+uses Pre-Vote again.
 
 
 ## Networks without Pre-Vote
 
-Pre-Vote uses the separate
-[`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) RPC. Its
-default implementation reports a granted Pre-Vote without contacting the
-target, so a network that does not implement it keeps the election behavior
-without Pre-Vote.
+The default implementation of
+[`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) returns
+[`PreVoteReply::Unsupported`](`crate::raft::PreVoteReply`) without contacting
+the target, so a network that does not implement it keeps the election
+behavior without Pre-Vote: every campaign runs the classic election.

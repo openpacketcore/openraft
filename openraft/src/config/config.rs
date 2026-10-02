@@ -269,9 +269,10 @@ pub struct Config {
     /// does not raise its term and depose a healthy leader once it can be reached again.
     ///
     /// Pre-Vote uses the separate
-    /// [`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) RPC. A network that does
-    /// not implement it reports every Pre-Vote as granted, so elections proceed as without
-    /// Pre-Vote; a transport error is never counted as a grant.
+    /// [`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) RPC. A voter that the
+    /// network does not know to answer it, including every voter of a network that does not
+    /// implement it, makes the campaign run the classic election instead; a transport error is
+    /// never counted as a grant.
     ///
     /// `None`, the default, is treated as disabled.
     // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
