@@ -928,8 +928,15 @@ where
             tracing::debug!(%target, "retire replication");
             // Close every sender before awaiting any task. A removed stream may still own
             // a log read or a snapshot, even though its progress notifications are stale.
-            drop(stream.tx_repl);
-            self.retired_replications.push(stream.join_handle);
+            // Closing also makes an in-flight AppendEntries give up at once.
+            let ReplicationHandle {
+                join_handle,
+                tx_repl,
+                tx_close,
+            } = stream;
+            drop(tx_repl);
+            drop(tx_close);
+            self.retired_replications.push(join_handle);
         }
     }
 

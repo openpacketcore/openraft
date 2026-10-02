@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::ReplicationCore;
@@ -300,6 +301,7 @@ impl RaftNetworkFactory<C> for NetworkFactory {
 struct Run {
     main: Main,
     tx: Option<mpsc::UnboundedSender<Replicate<C>>>,
+    tx_close: Option<watch::Sender<()>>,
     rx: mpsc::UnboundedReceiver<Notify<C>>,
     leader: ReadyStore,
     follower: ReadyStore,
@@ -344,12 +346,14 @@ impl Run {
             second_gate: None,
         };
         let (tx, rx_event) = mpsc::unbounded_channel();
+        let (tx_close, rx_close) = watch::channel(());
         let (tx_raft_core, rx) = mpsc::unbounded_channel();
         let core = Core {
             target: 2,
             session_id: ReplicationSessionId::new(vote(), Some(log_id(0))),
             tx_raft_core,
             rx_event,
+            rx_close,
             weak_tx_event: tx.downgrade(),
             network,
             snapshot_network: Arc::new(tokio::sync::Mutex::new(snapshot_network)),
@@ -380,6 +384,7 @@ impl Run {
         Self {
             main,
             tx: Some(tx),
+            tx_close: Some(tx_close),
             rx,
             leader,
             follower,
@@ -476,6 +481,7 @@ impl Run {
     fn close(&mut self) {
         let before = Instant::now();
         self.tx.take();
+        self.tx_close.take();
         assert!(
             matches!(self.poll(), Poll::Ready(Ok(()))),
             "zero_progress_close_does_not_wait_for_retry_timer"
@@ -497,6 +503,7 @@ impl Drop for Run {
             let _ = release.send(());
         }
         self.tx.take();
+        self.tx_close.take();
     }
 }
 
@@ -863,4 +870,24 @@ async fn elapsed_rpc_time_counts_toward_the_no_progress_interval() {
         run.assert_complete_suffix().await;
         run.close();
     }
+}
+
+/// Closing a stream gives up an AppendEntries that never answers at once, not at its deadline.
+///
+/// The RaftCore joins a closed stream before it answers the vote that made it stop leading, so a
+/// stream held by an unresponsive follower or learner would otherwise delay that answer by the
+/// whole AppendEntries deadline. The entries were read before the request was sent, so no storage
+/// operation is abandoned.
+#[tokio::test(start_paused = true)]
+async fn close_gives_up_an_append_entries_that_never_answers() {
+    let mut run = Run::new(Some(log_id(0)), vec![Reply::Timeout], false).await;
+    run.start_logs();
+    run.pending();
+    assert_eq!(
+        run.counts(),
+        (1, 1, 0),
+        "the entries were read and the request is in flight"
+    );
+    run.close();
+    assert_eq!(run.counts(), (1, 1, 0), "the request never completed");
 }
