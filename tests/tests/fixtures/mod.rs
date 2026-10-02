@@ -274,6 +274,9 @@ pub struct TypedRaftRouter {
     /// How long the reply to a Pre-Vote sent to a node takes to arrive, per target.
     pre_vote_reply_delay: Arc<Mutex<BTreeMap<MemNodeId, Duration>>>,
 
+    /// The Raft config of a node that does not use the router's config.
+    node_configs: Arc<Mutex<BTreeMap<MemNodeId, Arc<Config>>>>,
+
     /// A hook function to be called when before an RPC is sent to target node.
     rpc_pre_hook: Arc<Mutex<HashMap<RPCTypes, RPCPreHook>>>,
 
@@ -322,6 +325,7 @@ impl Builder {
             rpc_count: Default::default(),
             pre_vote_unsupported: Default::default(),
             pre_vote_reply_delay: Default::default(),
+            node_configs: Default::default(),
             rpc_pre_hook: Default::default(),
             rpc_observers: Default::default(),
             blocked_rpc: Default::default(),
@@ -513,8 +517,15 @@ impl TypedRaftRouter {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
+    /// Create node `id` with `config` instead of the router's config, such as a node of another
+    /// release with other timers. It applies to nodes created afterwards.
+    pub fn set_node_config(&self, id: MemNodeId, config: Arc<Config>) {
+        self.node_configs.lock().unwrap().insert(id, config);
+    }
+
     pub async fn new_raft_node_with_sto(&mut self, id: MemNodeId, log_store: MemLogStore, sm: MemStateMachine) {
-        let node = Raft::new(id, self.config.clone(), self.clone(), log_store.clone(), sm.clone()).await.unwrap();
+        let config = self.node_configs.lock().unwrap().get(&id).cloned().unwrap_or_else(|| self.config.clone());
+        let node = Raft::new(id, config, self.clone(), log_store.clone(), sm.clone()).await.unwrap();
         let mut rt = self.nodes.lock().unwrap();
         rt.insert(id, (node, log_store, sm));
     }
