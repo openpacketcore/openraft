@@ -48,7 +48,6 @@ impl Request {
     }
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Response {
     pub value: Option<String>,
