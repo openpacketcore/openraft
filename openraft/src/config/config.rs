@@ -254,6 +254,30 @@ pub struct Config {
            default_missing_value = "true"
     )]
     pub enable_elect: bool,
+
+    /// Whether a follower runs a Pre-Vote round before it increments its term and starts a real
+    /// election.
+    ///
+    /// When enabled, a voter whose election timer fires asks the other voters whether they *would*
+    /// grant it a vote at `term + 1`, without persisting a vote or changing its term. Only when a
+    /// quorum would grant does it start the real election. A voter that cannot currently win, for
+    /// example one that is cut off from the others, restarted, or behind on the log, therefore
+    /// does not raise its term and depose a healthy leader once it can be reached again.
+    ///
+    /// Pre-Vote uses the separate
+    /// [`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) RPC. A network that does
+    /// not implement it reports every Pre-Vote as granted, so elections proceed as without
+    /// Pre-Vote; a transport error is never counted as a grant.
+    ///
+    /// `None`, the default, is treated as disabled.
+    // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
+    // https://github.com/clap-rs/clap/discussions/4374
+    #[clap(long,
+           action = clap::ArgAction::Set,
+           num_args = 0..=1,
+           default_missing_value = "true"
+    )]
+    pub enable_pre_vote: Option<bool>,
 }
 
 /// Updatable config for a raft runtime.

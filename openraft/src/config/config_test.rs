@@ -117,6 +117,23 @@ fn test_config_append_entries_timeout() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_config_enable_pre_vote() -> anyhow::Result<()> {
+    let config = Config::build(&["foo"])?;
+    assert_eq!(None, config.enable_pre_vote);
+
+    let config = Config::build(&["foo", "--enable-pre-vote"])?;
+    assert_eq!(Some(true), config.enable_pre_vote);
+
+    let config = Config::build(&["foo", "--enable-pre-vote=true"])?;
+    assert_eq!(Some(true), config.enable_pre_vote);
+
+    let config = Config::build(&["foo", "--enable-pre-vote=false"])?;
+    assert_eq!(Some(false), config.enable_pre_vote);
+
+    Ok(())
+}
+
+#[test]
 fn test_config_snapshot_policy() -> anyhow::Result<()> {
     let config = Config::build(&["foo", "--snapshot-policy=never"])?;
     assert_eq!(SnapshotPolicy::Never, config.snapshot_policy);
