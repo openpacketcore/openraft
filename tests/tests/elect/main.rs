@@ -11,3 +11,4 @@ mod fixtures;
 mod t10_elect_compare_last_log;
 mod t11_elect_seize_leadership;
 mod t13_elect_while_leader;
+mod t20_lease_and_timeout_overlap;

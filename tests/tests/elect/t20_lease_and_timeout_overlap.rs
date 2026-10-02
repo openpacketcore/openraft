@@ -1,0 +1,90 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use maplit::btreeset;
+use openraft::Config;
+use openraft::ServerState;
+use tokio::time::Instant;
+
+use crate::fixtures::init_default_ut_tracing;
+use crate::fixtures::RaftRouter;
+
+/// After an unplanned leader loss, a follower campaigns once both its leader lease and its sampled
+/// election timeout have expired. The two run in parallel from the last leader contact; they are
+/// not waited for one after the other.
+///
+/// Every sampled election timeout covers the follower lease, so the first campaign starts within
+/// `election_timeout_max` plus one tick of the last leader contact, never before
+/// `election_timeout_min`. Waiting for the sum would hold every survivor back for at least
+/// `election_timeout_max + election_timeout_min`.
+#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn leader_loss_campaign_overlaps_lease_and_election_timeout() -> Result<()> {
+    let config = Arc::new(
+        Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 1_500,
+            election_timeout_max: 1_600,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let tick = Duration::from_millis(config.heartbeat_interval * 3 / 2);
+    let election_timeout_min = Duration::from_millis(config.election_timeout_min);
+    let election_timeout_max = Duration::from_millis(config.election_timeout_max);
+
+    let mut router = RaftRouter::new(config.clone());
+
+    tracing::info!("--- create cluster of 0,1,2; node 0 becomes leader");
+    router.new_cluster(btreeset! {0,1,2}, btreeset! {}).await?;
+
+    let n0 = router.get_raft_handle(&0)?;
+    n0.wait(timeout()).state(ServerState::Leader, "node 0 is the initial leader").await?;
+    for id in [1, 2] {
+        router
+            .wait(&id, timeout())
+            .metrics(|m| m.current_leader == Some(0), "the follower follows node 0")
+            .await?;
+    }
+
+    tracing::info!("--- lose the leader: node 0 can neither send nor receive");
+    let lost_at = Instant::now();
+    router.set_network_error(0, true);
+
+    tracing::info!("--- a survivor is elected");
+    for id in [1, 2] {
+        router
+            .wait(&id, Some(Duration::from_secs(10)))
+            .metrics(
+                |m| m.current_leader == Some(1) || m.current_leader == Some(2),
+                "a survivor leads after the leader loss",
+            )
+            .await?;
+    }
+    let elapsed = lost_at.elapsed();
+    tracing::info!("--- a survivor was elected {:?} after the leader loss", elapsed);
+
+    // The last leader contact is at most one tick before the loss. The campaign then starts on
+    // the first tick after the longer of the lease and the sampled timeout; the remaining slack
+    // covers the in-memory vote round trip and scheduling.
+    let slack = Duration::from_millis(600);
+    assert!(
+        elapsed < election_timeout_max + tick + slack,
+        "the first campaign waits for the longer of the lease and the timeout, not their sum: \
+         elected after {:?}, expected below {:?}",
+        elapsed,
+        election_timeout_max + tick + slack
+    );
+    assert!(
+        elapsed + tick >= election_timeout_min,
+        "the lease still holds back every campaign: elected after {:?}, lease {:?}",
+        elapsed,
+        election_timeout_min
+    );
+
+    Ok(())
+}
+
+fn timeout() -> Option<Duration> {
+    Some(Duration::from_millis(2_000))
+}
