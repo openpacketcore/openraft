@@ -219,18 +219,19 @@ where
     pub(crate) _p: PhantomData<SM>,
 }
 
-/// Whether [`RaftCore::spawn_parallel_vote_requests`] sends Vote or Pre-Vote requests.
+/// Whether [`RaftCore::spawn_parallel_vote_requests`] sends Vote requests or the Pre-Vote
+/// requests of one round.
 #[derive(Clone, Copy, Debug)]
 enum VoteRequestKind {
     Vote,
-    PreVote,
+    PreVote { round: u64 },
 }
 
 impl VoteRequestKind {
     fn as_str(self) -> &'static str {
         match self {
             VoteRequestKind::Vote => "vote",
-            VoteRequestKind::PreVote => "pre-vote",
+            VoteRequestKind::PreVote { .. } => "pre-vote",
         }
     }
 }
@@ -1226,7 +1227,7 @@ where
                     async move {
                         let tm_res = match kind {
                             VoteRequestKind::Vote => C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await,
-                            VoteRequestKind::PreVote => {
+                            VoteRequestKind::PreVote { .. } => {
                                 C::AsyncRuntime::timeout(ttl, client.pre_vote(req, option)).await
                             }
                         };
@@ -1257,11 +1258,9 @@ where
                                         resp,
                                         sender_vote: vote,
                                     },
-                                    VoteRequestKind::PreVote => Notify::PreVoteResponse {
-                                        target,
-                                        resp,
-                                        sender_vote: vote,
-                                    },
+                                    VoteRequestKind::PreVote { round } => {
+                                        Notify::PreVoteResponse { target, resp, round }
+                                    }
                                 };
                                 let _ = tx.send(notify);
                             }
@@ -1449,21 +1448,18 @@ where
                 }
             }
 
-            Notify::PreVoteResponse {
-                target,
-                resp,
-                sender_vote,
-            } => {
+            Notify::PreVoteResponse { target, resp, round } => {
                 tracing::info!(
                     resp = display(resp.summary()),
                     target = display(&target),
+                    round,
                     "received Notify::PreVoteResponse: {}",
                     func_name!()
                 );
 
-                if self.does_pre_vote_match(&sender_vote) {
-                    self.engine.handle_pre_vote_resp(target, resp);
-                }
+                // Rounds in one term propose the same vote, so only the round identifier tells a
+                // delayed response from a current one. The engine ignores any other round.
+                self.engine.handle_pre_vote_resp(target, round, resp);
             }
 
             Notify::HigherVote {
@@ -1834,21 +1830,6 @@ where
     /// round: each request is abandoned after `election_timeout_min`, a new round starts no earlier
     /// than one sampled election timeout after the previous one, and responses and ticks are
     /// delivered in order on the same channel.
-    fn does_pre_vote_match(&self, sender_vote: &Vote<C::NodeId>) -> bool {
-        let my_vote = self.engine.pre_candidate_ref().map(|x| x.vote_ref());
-
-        if Some(sender_vote) != my_vote {
-            tracing::warn!(
-                "A Pre-Vote response will be ignored because the round changed: sent by: {}; current round: {}",
-                sender_vote,
-                my_vote.display(),
-            );
-            false
-        } else {
-            true
-        }
-    }
-
     /// If a message is sent by a previous replication session but is received by current server
     /// state, it is a stale message and should be just ignored.
     fn does_replication_session_match(
@@ -1998,8 +1979,8 @@ where
             Command::SendVote { vote_req } => {
                 self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::Vote).await;
             }
-            Command::SendPreVote { vote_req } => {
-                self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::PreVote).await;
+            Command::SendPreVote { vote_req, round } => {
+                self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::PreVote { round }).await;
             }
             Command::ReplicateCommitted { committed } => {
                 for node in self.replications.values() {

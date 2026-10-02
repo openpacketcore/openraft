@@ -92,7 +92,11 @@ where C: RaftTypeConfig
     SendVote { vote_req: VoteRequest<C::NodeId> },
 
     /// Send a Pre-Vote request to all other voters.
-    SendPreVote { vote_req: VoteRequest<C::NodeId> },
+    SendPreVote {
+        vote_req: VoteRequest<C::NodeId>,
+        /// The Pre-Vote round that every response must name.
+        round: u64,
+    },
 
     /// Purge log from the beginning to `upto`, inclusive.
     PurgeLog { upto: LogId<C::NodeId> },
@@ -141,7 +145,7 @@ where
             (Command::RebuildReplicationStreams { targets },   Command::RebuildReplicationStreams { targets: b }, )                            => targets == b,
             (Command::SaveVote { vote },                       Command::SaveVote { vote: b })                                                  => vote == b,
             (Command::SendVote { vote_req },                   Command::SendVote { vote_req: b }, )                                            => vote_req == b,
-            (Command::SendPreVote { vote_req },                Command::SendPreVote { vote_req: b }, )                                         => vote_req == b,
+            (Command::SendPreVote { vote_req, round },         Command::SendPreVote { vote_req: b, round: b_round }, )                         => vote_req == b && round == b_round,
             (Command::PurgeLog { upto },                       Command::PurgeLog { upto: b })                                                  => upto == b,
             (Command::DeleteConflictLog { since },             Command::DeleteConflictLog { since: b }, )                                      => since == b,
             (Command::Respond { when, resp: send },            Command::Respond { when: b_when, resp: b })                                     => send == b && when == b_when,

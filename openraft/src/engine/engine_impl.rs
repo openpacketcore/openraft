@@ -110,6 +110,12 @@ where C: RaftTypeConfig
     /// persisted, and it is dropped once a real election starts or this node follows another vote.
     pub(crate) pre_candidate: CandidateState<C>,
 
+    /// The identifier of the latest Pre-Vote round.
+    ///
+    /// Rounds in one term propose the same hypothetical vote, so a response names its round by
+    /// this identifier instead. A response to any round but the one in flight is ignored.
+    pub(crate) pre_vote_round: u64,
+
     /// A candidate whose vote request this node rejected because that candidate's log was behind
     /// this node's, recorded only while this node has no leader.
     ///
@@ -143,6 +149,7 @@ where C: RaftTypeConfig
             leader: None,
             candidate: None,
             pre_candidate: None,
+            pre_vote_round: 0,
             stale_candidate: None,
             prepared_shutdown: None,
             output: EngineOutput::new(4096),
@@ -347,6 +354,7 @@ where C: RaftTypeConfig
         let new_term = self.state.vote.leader_id().term + 1;
         let pre_vote = Vote::new(new_term, self.config.id.clone());
 
+        self.pre_vote_round = self.pre_vote_round.wrapping_add(1);
         let pre_candidate = self.new_pre_candidate(pre_vote.clone());
         tracing::info!("{}, new pre-candidate: {}", func_name!(), pre_candidate);
 
@@ -362,6 +370,7 @@ where C: RaftTypeConfig
 
         self.output.push_command(Command::SendPreVote {
             vote_req: VoteRequest::new(pre_vote, last_log_id),
+            round: self.pre_vote_round,
         });
     }
 
@@ -553,21 +562,31 @@ where C: RaftTypeConfig
         VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), granted)
     }
 
-    /// Handle a Pre-Vote response.
+    /// Handle a response to the Pre-Vote round `round`.
     ///
     /// Count a granted Pre-Vote; once a quorum would grant, start the real election. A rejection
     /// that reports a greater log delays the next campaign, and one that reports a strictly higher
     /// vote catches this node up to that vote in non-committed form, as a rejected real vote does.
+    /// A response to any round but the one in flight is ignored.
     #[tracing::instrument(level = "debug", skip(self, resp))]
-    pub(crate) fn handle_pre_vote_resp(&mut self, target: C::NodeId, resp: VoteResponse<C::NodeId>) {
+    pub(crate) fn handle_pre_vote_resp(&mut self, target: C::NodeId, round: u64, resp: VoteResponse<C::NodeId>) {
         tracing::info!(
             resp = display(resp.summary()),
             target = display(&target),
+            round,
             my_vote = display(self.state.vote_ref()),
             my_last_log_id = display(self.state.last_log_id().summary()),
             "{}",
             func_name!()
         );
+
+        if round != self.pre_vote_round {
+            tracing::info!(
+                current_round = self.pre_vote_round,
+                "ignore a response to an earlier Pre-Vote round"
+            );
+            return;
+        }
 
         let Some(pre_candidate) = self.pre_candidate.as_mut() else {
             // The Pre-Vote round has finished or been canceled; ignore the delayed response.

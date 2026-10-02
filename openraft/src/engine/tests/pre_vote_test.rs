@@ -72,7 +72,8 @@ fn test_pre_elect_changes_no_state() -> anyhow::Result<()> {
     // Only SendPreVote is emitted: no SaveVote and no SendVote.
     assert_eq!(
         vec![Command::SendPreVote {
-            vote_req: VoteRequest::new(Vote::new(2, 1), Some(log_id(1, 2, 3)))
+            vote_req: VoteRequest::new(Vote::new(2, 1), Some(log_id(1, 2, 3))),
+            round: 1,
         }],
         eng.output.take_commands()
     );
@@ -186,6 +187,7 @@ fn test_handle_pre_vote_resp_quorum_starts_real_election() -> anyhow::Result<()>
 
     eng.handle_pre_vote_resp(
         3,
+        eng.pre_vote_round,
         VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true),
     );
 
@@ -219,6 +221,7 @@ fn test_handle_pre_vote_resp_rejection_keeps_waiting() -> anyhow::Result<()> {
 
     eng.handle_pre_vote_resp(
         3,
+        eng.pre_vote_round,
         VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), false),
     );
 
@@ -231,6 +234,7 @@ fn test_handle_pre_vote_resp_rejection_keeps_waiting() -> anyhow::Result<()> {
     tracing::info!("--- a rejection that reports a greater log delays the next campaign");
     eng.handle_pre_vote_resp(
         2,
+        eng.pre_vote_round,
         VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 5)), false),
     );
     assert!(eng.is_there_greater_log());
@@ -248,6 +252,7 @@ fn test_handle_pre_vote_resp_rejection_adopts_a_higher_vote() -> anyhow::Result<
 
     eng.handle_pre_vote_resp(
         3,
+        eng.pre_vote_round,
         VoteResponse::new(Vote::new_committed(5, 3), Some(log_id(1, 2, 3)), false),
     );
 
@@ -268,7 +273,11 @@ fn test_handle_pre_vote_resp_rejection_with_equal_vote_keeps_the_round() -> anyh
     eng.output.take_commands();
     let vote_before = *eng.state.vote_ref();
 
-    eng.handle_pre_vote_resp(3, VoteResponse::new(vote_before, Some(log_id(1, 2, 3)), false));
+    eng.handle_pre_vote_resp(
+        3,
+        eng.pre_vote_round,
+        VoteResponse::new(vote_before, Some(log_id(1, 2, 3)), false),
+    );
 
     assert!(
         eng.pre_candidate_ref().is_some(),
@@ -294,7 +303,11 @@ fn test_accepted_vote_ends_the_pre_vote_round() -> anyhow::Result<()> {
     assert_eq!(leader_vote, *eng.state.vote_ref());
 
     // A delayed grant for the ended round starts nothing.
-    eng.handle_pre_vote_resp(3, VoteResponse::new(leader_vote, Some(log_id(1, 2, 3)), true));
+    eng.handle_pre_vote_resp(
+        3,
+        eng.pre_vote_round,
+        VoteResponse::new(leader_vote, Some(log_id(1, 2, 3)), true),
+    );
     assert!(eng.candidate_ref().is_none());
     assert_eq!(leader_vote, *eng.state.vote_ref());
     assert_eq!(0, eng.output.take_commands().len());
@@ -324,6 +337,7 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     eng.pre_elect();
     eng.handle_pre_vote_resp(
         2,
+        eng.pre_vote_round,
         VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true),
     );
     assert_eq!(Vote::new(2, 1), *eng.candidate_ref().unwrap().vote_ref());
@@ -341,7 +355,11 @@ fn test_winning_election_ends_an_overlapping_pre_vote_round() -> anyhow::Result<
     eng.output.take_commands();
 
     // A delayed grant for round B starts no campaign on the leader.
-    eng.handle_pre_vote_resp(2, VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 2, 3)), true));
+    eng.handle_pre_vote_resp(
+        2,
+        eng.pre_vote_round,
+        VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 2, 3)), true),
+    );
     assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
     assert_eq!(ServerState::Leader, eng.state.server_state);
     assert_eq!(0, eng.output.take_commands().len());
@@ -402,7 +420,7 @@ fn test_handle_pre_vote_resp_rejection_never_adopts_a_vote_for_this_node() -> an
 
     // A network that cannot ask the voter answers with a rejection of its own. If it echoed the
     // proposed vote, adopting it would vote for this node in a term it never campaigned in.
-    eng.handle_pre_vote_resp(3, VoteResponse::new(proposed, None, false));
+    eng.handle_pre_vote_resp(3, eng.pre_vote_round, VoteResponse::new(proposed, None, false));
 
     assert_eq!(vote_before, *eng.state.vote_ref());
     assert!(
@@ -424,6 +442,7 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
     let mut eng = eng(m123());
     eng.pre_elect();
     eng.output.take_commands();
+    let first_round = eng.pre_vote_round;
     let first_round_vote = *eng.pre_candidate_ref().unwrap().vote_ref();
 
     // Leader 2 replicates a membership without voter 3 in its unchanged term, which ends the round.
@@ -442,12 +461,11 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
         *eng.pre_candidate_ref().unwrap().vote_ref(),
         "both rounds propose the same vote"
     );
+    assert_ne!(first_round, eng.pre_vote_round, "each round has its own identifier");
 
     // Voter 3's grant for the first round arrives now.
-    eng.handle_pre_vote_resp(
-        3,
-        VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true),
-    );
+    let grant = VoteResponse::new(Vote::new_committed(1, 2), Some(log_id(1, 2, 3)), true);
+    eng.handle_pre_vote_resp(3, first_round, grant.clone());
 
     assert!(eng.pre_candidate_ref().is_some(), "the new round keeps waiting");
     assert_eq!(
@@ -456,6 +474,17 @@ fn test_delayed_pre_vote_grant_from_a_removed_voter_does_not_reach_a_later_round
     );
     assert!(eng.candidate_ref().is_none(), "no real election starts");
     assert_eq!(Vote::new_committed(1, 2), *eng.state.vote_ref());
+    assert_eq!(0, eng.output.take_commands().len());
+
+    // Even a grant that names the new round cannot count for a node outside its quorum set.
+    eng.handle_pre_vote_resp(3, eng.pre_vote_round, grant);
+
+    assert!(eng.pre_candidate_ref().is_some(), "the new round keeps waiting");
+    assert_eq!(
+        btreeset! {1},
+        eng.pre_candidate_ref().unwrap().granters().collect::<BTreeSet<_>>()
+    );
+    assert!(eng.candidate_ref().is_none(), "no real election starts");
     assert_eq!(0, eng.output.take_commands().len());
 
     Ok(())

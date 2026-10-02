@@ -92,8 +92,20 @@ where
     }
 
     /// Grant the vote by a node.
+    ///
+    /// A grant from a node outside this round's quorum set is ignored: it can never count toward
+    /// a quorum, and a delayed or misdirected response must never stop this node.
     pub(crate) fn grant_by(&mut self, target: &C::NodeId) -> bool {
-        let granted = *self.progress.update(target, true).expect("target not in quorum set");
+        let granted = match self.progress.update(target, true) {
+            Ok(granted) => *granted,
+            Err(_) => {
+                tracing::warn!(
+                    target = display(target),
+                    "ignore a grant from a node that does not vote in this round"
+                );
+                return false;
+            }
+        };
 
         tracing::info!(voting = display(&self), "{}", func_name!());
 
