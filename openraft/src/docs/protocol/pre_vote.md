@@ -58,7 +58,9 @@ would grant.
 If a quorum would grant, the voter starts the real election, increments its
 term and persists its vote as usual. A response with a strictly higher vote
 catches the requester up to that vote in non-committed form, as a rejected real
-vote does. A rejection that reports a greater log delays the next attempt. Any
+vote does, unless it is a vote for the requester itself: no voter holds one for
+a term the requester never campaigned in. A rejection that reports a greater
+log delays the next attempt. Any
 vote the requester accepts afterwards, including a heartbeat from the current
 leader, ends the round. Otherwise the round is retried after one newly sampled
 election timeout.
@@ -67,6 +69,36 @@ Only a response counts toward the quorum. An error, including an unreachable
 peer, is never a grant, so a voter that is cut off cannot assemble one.
 
 A voter that is the only voter wins its own Pre-Vote and elects at once.
+
+
+## Voters that cannot answer Pre-Vote
+
+A network may reach voters that cannot answer a Pre-Vote request, such as
+voters of a release without Pre-Vote during a rolling upgrade. Such a voter
+campaigns with the real vote alone and grants real votes by the rules above. A
+network that knows a voter is one of them answers its Pre-Vote locally, as a
+rejection that carries no vote to catch up to, and never sends it a request it
+could not decode.
+
+Counting such a voter as rejecting keeps a voter that runs Pre-Vote from
+campaigning, and raising its term, before a voter without Pre-Vote that may
+hold a more up-to-date log campaigns. That voter then wins with the real vote.
+When its log is behind, it cannot win, and a voter whose log is more up to date
+must campaign instead, although its own Pre-Vote may never reach a quorum:
+
+- A voter that rejects a real vote request because the candidate's log is
+  behind its own, while it has no leader, records that candidate's term.
+- If it hears from no leader for one election timeout after the first such
+  rejection, it campaigns without Pre-Vote, in a term above every recorded
+  term. The candidate voted for itself in its own term, so a campaign in that
+  term could not win its vote.
+- The wait lets that candidate still win with the other voters' grants, without
+  being disrupted.
+- Hearing from a leader, granting a vote, leading or campaigning clears the
+  record.
+
+The rule changes no vote rule: a voter still grants only a candidate whose log
+is at least as up to date as its own. It only decides when a voter campaigns.
 
 
 ## Networks without Pre-Vote
