@@ -266,6 +266,10 @@ pub struct TypedRaftRouter {
     /// Count of RPCs sent.
     rpc_count: Arc<Mutex<HashMap<RPCTypes, u64>>>,
 
+    /// Nodes that cannot answer Pre-Vote, such as voters of a release without it. A Pre-Vote to
+    /// one of them is answered as a rejection without reaching it.
+    pre_vote_unsupported: Arc<Mutex<BTreeSet<MemNodeId>>>,
+
     /// A hook function to be called when before an RPC is sent to target node.
     rpc_pre_hook: Arc<Mutex<HashMap<RPCTypes, RPCPreHook>>>,
 
@@ -312,6 +316,7 @@ impl Builder {
             send_delay: Arc::new(AtomicU64::new(send_delay)),
             append_entries_quota: Arc::new(Mutex::new(None)),
             rpc_count: Default::default(),
+            pre_vote_unsupported: Default::default(),
             rpc_pre_hook: Default::default(),
             rpc_observers: Default::default(),
             blocked_rpc: Default::default(),
@@ -566,6 +571,17 @@ impl TypedRaftRouter {
     }
 
     /// Set whether to emit a specified rpc error when sending to/receiving from a node.
+    /// Answer every Pre-Vote to `id` as a rejection without reaching it, as a network does for a
+    /// voter of a release without Pre-Vote.
+    pub fn set_pre_vote_unsupported(&self, id: MemNodeId, unsupported: bool) {
+        let mut nodes = self.pre_vote_unsupported.lock().unwrap();
+        if unsupported {
+            nodes.insert(id);
+        } else {
+            nodes.remove(&id);
+        }
+    }
+
     pub fn set_rpc_failure(&self, id: MemNodeId, dir: Direction, rpc_error_type: Option<RPCErrorType>) {
         let mut fails = self.fail_rpc.lock().unwrap();
         if let Some(rpc_error_type) = rpc_error_type {
@@ -1177,6 +1193,11 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
         self.owner.emit_rpc_error(from_id, self.target)?;
         self.owner.rand_send_delay().await;
+
+        if self.owner.pre_vote_unsupported.lock().unwrap().contains(&self.target) {
+            // A rejection that carries no vote to catch up to.
+            return Ok(VoteResponse::new(Vote::new(0, from_id), None, false));
+        }
 
         let node = self.owner.get_raft_handle(&self.target)?;
 
