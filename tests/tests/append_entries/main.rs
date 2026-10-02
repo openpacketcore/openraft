@@ -19,4 +19,5 @@ mod t60_enable_heartbeat;
 mod t61_heartbeat_reject_vote;
 mod t61_large_heartbeat;
 mod t62_append_entries_deadline;
+mod t63_vote_with_hung_learner;
 mod t90_issue_216_stale_last_log_id;
