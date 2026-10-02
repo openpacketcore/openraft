@@ -469,6 +469,21 @@ where C: RaftTypeConfig
 
         let res = self.vote_handler().update_vote(&req.vote);
 
+        if res.is_err() && req.last_log_id.as_ref() > self.state.last_log_id() && self.is_campaigning() {
+            // A candidate whose log is more up to date than this node's is refused only because this
+            // node voted for itself, which cannot win against that log. Its next campaign is in a
+            // later term; had this node campaigned again before it, that term would hold another
+            // self-vote, and so on. Defer the next campaign by the greater-log timeout from now, as
+            // after seeing a greater log in a vote response: the candidate's next campaign finds no
+            // new self-vote, and this node grants it.
+            tracing::info!(
+                req = display(req.summary()),
+                "defer the next campaign to a candidate with a greater log"
+            );
+            self.set_greater_log();
+            self.state.vote.touch(C::now());
+        }
+
         tracing::info!(
             req = display(req.summary()),
             result = debug(&res),
@@ -990,6 +1005,12 @@ where C: RaftTypeConfig
         } else {
             Ok(())
         }
+    }
+
+    /// Whether this node campaigns: it holds an uncommitted vote for itself.
+    fn is_campaigning(&self) -> bool {
+        let vote = self.state.vote_ref();
+        !vote.is_committed() && vote.leader_id().voted_for().as_ref() == Some(&self.config.id)
     }
 
     pub(crate) fn is_there_greater_log(&self) -> bool {

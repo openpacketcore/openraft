@@ -282,3 +282,48 @@ fn test_handle_vote_req_granted_follower_learner_does_not_emit_update_server_sta
     }
     Ok(())
 }
+
+/// A candidate refused only because this campaigning node voted for itself, whose log is more up
+/// to date, makes this node defer its next campaign: by the greater-log timeout, from now.
+#[test]
+fn test_handle_vote_req_refused_fresher_candidate_defers_the_next_campaign() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.log_ids = LogIdList::new(vec![log_id(2, 1, 3)]);
+    let utime_before = eng.state.vote_last_modified().unwrap();
+    assert!(!eng.is_there_greater_log());
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(2, 0),
+        last_log_id: Some(log_id(2, 1, 4)),
+    });
+
+    assert!(!resp.vote_granted, "this node already voted for itself in term 2");
+    assert_eq!(Vote::new(2, 1), *eng.state.vote_ref());
+    assert!(eng.is_there_greater_log(), "the greater-log timeout applies");
+    assert!(
+        eng.state.vote_last_modified().unwrap() > utime_before,
+        "the election timer restarts from now"
+    );
+    assert_eq!(0, eng.output.take_commands().len(), "nothing is persisted");
+
+    Ok(())
+}
+
+/// A candidate refused for its vote whose log is not more up to date changes nothing.
+#[test]
+fn test_handle_vote_req_refused_candidate_without_a_greater_log_defers_nothing() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.log_ids = LogIdList::new(vec![log_id(2, 1, 3)]);
+    let utime_before = eng.state.vote_last_modified();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(2, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert!(!resp.vote_granted);
+    assert!(!eng.is_there_greater_log());
+    assert_eq!(utime_before, eng.state.vote_last_modified());
+
+    Ok(())
+}
