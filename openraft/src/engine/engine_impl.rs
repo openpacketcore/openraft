@@ -555,8 +555,10 @@ where C: RaftTypeConfig
         }
 
         // Catch up to a strictly higher vote, never as committed. An equal vote is left alone: it
-        // would end the in-flight round without new information.
-        if &resp.vote > self.state.vote_ref() {
+        // would end the in-flight round without new information. A vote for this node is not
+        // adopted either: no voter holds one for a term this node did not campaign in, so it can
+        // only be a network's own answer, and adopting it would vote for this node unsent.
+        if &resp.vote > self.state.vote_ref() && resp.vote.leader_id().voted_for() != Some(self.config.id.clone()) {
             let mut vote = resp.vote.clone();
             vote.committed = false;
             let _ = self.vote_handler().update_vote(&vote);
