@@ -91,6 +91,9 @@ where C: RaftTypeConfig
     /// Send vote to all other members
     SendVote { vote_req: VoteRequest<C::NodeId> },
 
+    /// Send a Pre-Vote request to all other voters.
+    SendPreVote { vote_req: VoteRequest<C::NodeId> },
+
     /// Purge log from the beginning to `upto`, inclusive.
     PurgeLog { upto: LogId<C::NodeId> },
 
@@ -138,6 +141,7 @@ where
             (Command::RebuildReplicationStreams { targets },   Command::RebuildReplicationStreams { targets: b }, )                            => targets == b,
             (Command::SaveVote { vote },                       Command::SaveVote { vote: b })                                                  => vote == b,
             (Command::SendVote { vote_req },                   Command::SendVote { vote_req: b }, )                                            => vote_req == b,
+            (Command::SendPreVote { vote_req },                Command::SendPreVote { vote_req: b }, )                                         => vote_req == b,
             (Command::PurgeLog { upto },                       Command::PurgeLog { upto: b })                                                  => upto == b,
             (Command::DeleteConflictLog { since },             Command::DeleteConflictLog { since: b }, )                                      => since == b,
             (Command::Respond { when, resp: send },            Command::Respond { when: b_when, resp: b })                                     => send == b && when == b_when,
@@ -167,6 +171,7 @@ where C: RaftTypeConfig
             Command::ReplicateCommitted { .. }        => CommandKind::Network,
             Command::Replicate { .. }                 => CommandKind::Network,
             Command::SendVote { .. }                  => CommandKind::Network,
+            Command::SendPreVote { .. }               => CommandKind::Network,
 
             Command::StateMachine { .. }              => CommandKind::StateMachine,
             // Apply is firstly handled by RaftCore, then forwarded to state machine worker.
@@ -190,6 +195,7 @@ where C: RaftTypeConfig
             Command::RebuildReplicationStreams { .. } => None,
             Command::SaveVote { .. }                  => None,
             Command::SendVote { .. }                  => None,
+            Command::SendPreVote { .. }               => None,
             Command::PurgeLog { .. }                  => None,
             Command::DeleteConflictLog { .. }         => None,
             Command::Respond { when, .. }             => when.as_ref(),

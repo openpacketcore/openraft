@@ -35,6 +35,7 @@ impl<C: RaftTypeConfig> Engine<C> {
             None
         };
         self.candidate = None;
+        self.pre_candidate = None;
         self.prepared_shutdown = Some(PreparedShutdown {
             handoff: handoff.clone(),
         });

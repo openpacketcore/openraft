@@ -284,6 +284,7 @@ pub struct Config {
 pub(crate) struct RuntimeConfig {
     pub(crate) enable_heartbeat: AtomicBool,
     pub(crate) enable_elect: AtomicBool,
+    pub(crate) enable_pre_vote: AtomicBool,
 }
 
 impl RuntimeConfig {
@@ -291,6 +292,7 @@ impl RuntimeConfig {
         Self {
             enable_heartbeat: AtomicBool::from(config.enable_heartbeat),
             enable_elect: AtomicBool::from(config.enable_elect),
+            enable_pre_vote: AtomicBool::from(config.get_enable_pre_vote()),
         }
     }
 }
@@ -305,6 +307,13 @@ impl Config {
     /// Generate a new random election timeout within the configured min & max.
     pub fn new_rand_election_timeout<RT: AsyncRuntime>(&self) -> u64 {
         RT::thread_rng().gen_range(self.election_timeout_min..self.election_timeout_max)
+    }
+
+    /// Whether a voter runs a Pre-Vote round before it starts a real election.
+    ///
+    /// `None` is treated as disabled.
+    pub(crate) fn get_enable_pre_vote(&self) -> bool {
+        self.enable_pre_vote.unwrap_or(false)
     }
 
     /// Get the deadline of one AppendEntries RPC.

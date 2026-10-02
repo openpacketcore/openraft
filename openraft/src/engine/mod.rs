@@ -48,6 +48,7 @@ mod tests {
     mod install_full_snapshot_test;
     mod leadership_transfer_test;
     mod log_id_list_test;
+    mod pre_vote_test;
     mod startup_test;
     mod trigger_purge_log_test;
 }

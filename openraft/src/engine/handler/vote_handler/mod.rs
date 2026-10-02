@@ -40,6 +40,7 @@ where C: RaftTypeConfig
     pub(crate) output: &'st mut EngineOutput<C>,
     pub(crate) leader: &'st mut LeaderState<C>,
     pub(crate) candidate: &'st mut CandidateState<C>,
+    pub(crate) pre_candidate: &'st mut CandidateState<C>,
 }
 
 impl<C> VoteHandler<'_, C>
@@ -117,6 +118,11 @@ where C: RaftTypeConfig
         // Update vote related timer and lease.
 
         tracing::debug!(now = debug(C::now()), "{}", func_name!());
+
+        // An accepted vote, including a heartbeat from the current leader, ends an in-flight
+        // Pre-Vote round: its outcome no longer reflects this node's view of the cluster. The
+        // periodic re-evaluation of the server state does not, because it changes no vote.
+        *self.pre_candidate = None;
 
         self.update_internal_server_state();
 

@@ -79,6 +79,27 @@ where C: RaftTypeConfig
         option: RPCOption,
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>;
 
+    /// Send a Pre-Vote RPC to the target.
+    ///
+    /// The node that receives it passes it to [`Raft::pre_vote()`]. It asks whether the target
+    /// *would* grant a vote for `rpc.vote`, the sender's next term, without the target persisting
+    /// a vote or changing its term. It is only sent when
+    /// [`Config::enable_pre_vote`](`crate::Config::enable_pre_vote`) is enabled.
+    ///
+    /// The default implementation reports a granted Pre-Vote without contacting the target, so a
+    /// network that does not implement it makes Pre-Vote a no-op and elections proceed as without
+    /// it. An implementation that cannot reach the target must return an error instead: an error
+    /// is never counted as a grant, so a voter that is cut off cannot assemble a quorum.
+    ///
+    /// [`Raft::pre_vote()`]: crate::Raft::pre_vote
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<C::NodeId>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+        Ok(VoteResponse::new(rpc.vote, None, true))
+    }
+
     /// Send a complete Snapshot to the target.
     ///
     /// This method is responsible to fragment the snapshot and send it to the target node.

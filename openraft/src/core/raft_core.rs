@@ -219,6 +219,22 @@ where
     pub(crate) _p: PhantomData<SM>,
 }
 
+/// Whether [`RaftCore::spawn_parallel_vote_requests`] sends Vote or Pre-Vote requests.
+#[derive(Clone, Copy, Debug)]
+enum VoteRequestKind {
+    Vote,
+    PreVote,
+}
+
+impl VoteRequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            VoteRequestKind::Vote => "vote",
+            VoteRequestKind::PreVote => "pre-vote",
+        }
+    }
+}
+
 impl<C, N, LS, SM> RaftCore<C, N, LS, SM>
 where
     C: RaftTypeConfig,
@@ -1173,9 +1189,12 @@ where
         Ok(at_most)
     }
 
-    /// Spawn parallel vote requests to all cluster members.
+    /// Spawn parallel Vote or Pre-Vote requests, selected by `kind`, to all other voters.
+    ///
+    /// Only a response counts toward a quorum. A transport error, including an unreachable peer,
+    /// is never a grant: otherwise a voter that is cut off would assemble a Pre-Vote quorum.
     #[tracing::instrument(level = "trace", skip_all, fields(vote=vote_req.summary()))]
-    async fn spawn_parallel_vote_requests(&mut self, vote_req: &VoteRequest<C::NodeId>) {
+    async fn spawn_parallel_vote_requests(&mut self, vote_req: &VoteRequest<C::NodeId>, kind: VoteRequestKind) {
         let members = self.engine.state.membership_state.effective().voter_ids();
 
         let vote = vote_req.vote.clone();
@@ -1205,7 +1224,12 @@ where
                     let vote = vote.clone();
 
                     async move {
-                        let tm_res = C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await;
+                        let tm_res = match kind {
+                            VoteRequestKind::Vote => C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await,
+                            VoteRequestKind::PreVote => {
+                                C::AsyncRuntime::timeout(ttl, client.pre_vote(req, option)).await
+                            }
+                        };
                         let res = match tm_res {
                             Ok(res) => res,
 
@@ -1216,26 +1240,43 @@ where
                                     target: target.clone(),
                                     timeout: ttl,
                                 };
-                                tracing::error!({error = %timeout_err, target = display(&target)}, "timeout");
+                                tracing::error!(
+                                    {error = %timeout_err, target = display(&target)},
+                                    "timeout while requesting {}",
+                                    kind.as_str()
+                                );
                                 return;
                             }
                         };
 
                         match res {
                             Ok(resp) => {
-                                let _ = tx.send(Notify::VoteResponse {
-                                    target,
-                                    resp,
-                                    sender_vote: vote,
-                                });
+                                let notify = match kind {
+                                    VoteRequestKind::Vote => Notify::VoteResponse {
+                                        target,
+                                        resp,
+                                        sender_vote: vote,
+                                    },
+                                    VoteRequestKind::PreVote => Notify::PreVoteResponse {
+                                        target,
+                                        resp,
+                                        sender_vote: vote,
+                                    },
+                                };
+                                let _ = tx.send(notify);
                             }
-                            Err(err) => tracing::error!({error=%err, target=display(&target)}, "while requesting vote"),
+                            Err(err) => tracing::error!(
+                                {error=%err, target=display(&target)},
+                                "while requesting {}",
+                                kind.as_str()
+                            ),
                         }
                     }
                 }
                 .instrument(tracing::debug_span!(
                     parent: &Span::current(),
                     "send_vote_req",
+                    kind = kind.as_str(),
                     target = display(&target)
                 )),
             );
@@ -1247,6 +1288,18 @@ where
         tracing::info!(req = display(req.summary()), func = func_name!());
 
         let resp = self.engine.handle_vote_req(req);
+        self.engine.output.push_command(Command::Respond {
+            when: None,
+            resp: Respond::new(Ok(resp), tx),
+        });
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(super) fn handle_pre_vote_request(&mut self, req: VoteRequest<C::NodeId>, tx: VoteTx<C>) {
+        tracing::info!(req = display(req.summary()), func = func_name!());
+
+        // A Pre-Vote persists nothing, so there is no IO to wait for.
+        let resp = self.engine.handle_pre_vote_req(req);
         self.engine.output.push_command(Command::Respond {
             when: None,
             resp: Respond::new(Ok(resp), tx),
@@ -1283,6 +1336,11 @@ where
                 );
 
                 self.handle_vote_request(rpc, tx);
+            }
+            RaftMsg::RequestPreVote { rpc, tx } => {
+                tracing::info!(pre_vote_request = display(&rpc), "received RaftMsg::RequestPreVote");
+
+                self.handle_pre_vote_request(rpc, tx);
             }
             RaftMsg::BeginReceivingSnapshot { tx } => {
                 self.engine.handle_begin_receiving_snapshot(tx);
@@ -1388,6 +1446,23 @@ where
 
                 if self.does_vote_match(&sender_vote, "VoteResponse") {
                     self.engine.handle_vote_resp(target, resp);
+                }
+            }
+
+            Notify::PreVoteResponse {
+                target,
+                resp,
+                sender_vote,
+            } => {
+                tracing::info!(
+                    resp = display(resp.summary()),
+                    target = display(&target),
+                    "received Notify::PreVoteResponse: {}",
+                    func_name!()
+                );
+
+                if self.does_pre_vote_match(&sender_vote) {
+                    self.engine.handle_pre_vote_resp(target, resp);
                 }
             }
 
@@ -1620,7 +1695,9 @@ where
             return;
         }
 
-        if self.engine.state.membership_state.effective().voter_ids().count() == 1 {
+        let voter_count = self.engine.state.membership_state.effective().voter_ids().count();
+
+        if voter_count == 1 {
             if self.engine.candidate_ref().is_some() {
                 tracing::debug!("skip election, single voter already has an active election in progress");
                 return;
@@ -1658,11 +1735,36 @@ where
             tracing::info!("election timeout passed, check if it is a voter for election");
         }
 
+        // Pre-Vote applies to multiple voters only: a single voter always wins its own Pre-Vote.
+        let pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && voter_count > 1;
+
+        if pre_vote {
+            // A Pre-Vote round does not update the vote, so the expired election timer would
+            // restart it on every tick. Keep a round in flight for one sampled election timeout.
+            let timer_config = &self.engine.config.timer_config;
+            let mut round_timeout = timer_config.election_timeout;
+            if self.engine.is_there_greater_log() {
+                round_timeout += timer_config.smaller_log_timeout;
+            }
+
+            if let Some(started) = self.engine.pre_candidate_ref().map(|x| x.starting_time()) {
+                if now < started + round_timeout {
+                    tracing::debug!("a Pre-Vote round is already in flight");
+                    return;
+                }
+            }
+        }
+
         // Every time elect, reset this flag.
         self.engine.reset_greater_log();
 
-        tracing::info!("do trigger election");
-        self.engine.elect();
+        if pre_vote {
+            tracing::info!("do trigger Pre-Vote");
+            self.engine.pre_elect();
+        } else {
+            tracing::info!("do trigger election");
+            self.engine.elect();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -1719,6 +1821,23 @@ where
             true
         }
     }
+    /// A Pre-Vote response belongs to the in-flight Pre-Vote round only if it answers that round's
+    /// vote; otherwise it is stale and ignored.
+    fn does_pre_vote_match(&self, sender_vote: &Vote<C::NodeId>) -> bool {
+        let my_vote = self.engine.pre_candidate_ref().map(|x| x.vote_ref());
+
+        if Some(sender_vote) != my_vote {
+            tracing::warn!(
+                "A Pre-Vote response will be ignored because the round changed: sent by: {}; current round: {}",
+                sender_vote,
+                my_vote.display(),
+            );
+            false
+        } else {
+            true
+        }
+    }
+
     /// If a message is sent by a previous replication session but is received by current server
     /// state, it is a stale message and should be just ignored.
     fn does_replication_session_match(
@@ -1866,7 +1985,10 @@ where
                 }
             }
             Command::SendVote { vote_req } => {
-                self.spawn_parallel_vote_requests(&vote_req).await;
+                self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::Vote).await;
+            }
+            Command::SendPreVote { vote_req } => {
+                self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::PreVote).await;
             }
             Command::ReplicateCommitted { committed } => {
                 for node in self.replications.values() {

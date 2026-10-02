@@ -20,6 +20,14 @@ where C: RaftTypeConfig
         sender_vote: Vote<C::NodeId>,
     },
 
+    PreVoteResponse {
+        target: C::NodeId,
+        resp: VoteResponse<C::NodeId>,
+
+        /// The hypothetical next-term vote of the Pre-Vote round that sent the request.
+        sender_vote: Vote<C::NodeId>,
+    },
+
     /// Seen a higher `vote`.
     HigherVote {
         /// The ID of the target node from which the new term was observed.
@@ -72,6 +80,18 @@ where C: RaftTypeConfig
                 sender_vote: vote,
             } => {
                 format!("VoteResponse: from: {}: {}, res-vote: {}", target, resp.summary(), vote)
+            }
+            Self::PreVoteResponse {
+                target,
+                resp,
+                sender_vote: vote,
+            } => {
+                format!(
+                    "PreVoteResponse: from: {}: {}, pre-vote: {}",
+                    target,
+                    resp.summary(),
+                    vote
+                )
             }
             Self::HigherVote {
                 ref target,

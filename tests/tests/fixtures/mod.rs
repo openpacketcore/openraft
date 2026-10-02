@@ -1164,6 +1164,27 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
 
         Ok(resp)
     }
+
+    /// Send a Pre-Vote RPC to the target Raft node.
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<MemNodeId>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
+        let from_id = rpc.vote.leader_id().voted_for().unwrap();
+
+        self.owner.count_rpc(RPCTypes::Vote);
+        self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
+        self.owner.emit_rpc_error(from_id, self.target)?;
+        self.owner.rand_send_delay().await;
+
+        let node = self.owner.get_raft_handle(&self.target)?;
+
+        let resp = node.pre_vote(rpc).await;
+        let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
+
+        Ok(resp)
+    }
 }
 
 pub enum ValueTest<T> {

@@ -423,6 +423,19 @@ where C: RaftTypeConfig
         self.inner.call_core(RaftMsg::RequestVote { rpc, tx }, rx).await
     }
 
+    /// Submit a Pre-Vote RPC to this Raft node.
+    ///
+    /// A voter sends it before it increments its term, to ask whether this node *would* grant a
+    /// vote for `rpc.vote`. This node judges it by the same leader-lease and last-log-id rules as
+    /// [`Raft::vote()`], but it never persists a vote or changes its term in response.
+    #[tracing::instrument(level = "debug", skip(self, rpc))]
+    pub async fn pre_vote(&self, rpc: VoteRequest<C::NodeId>) -> Result<VoteResponse<C::NodeId>, RaftError<C::NodeId>> {
+        tracing::info!(rpc = display(rpc.summary()), "Raft::pre_vote()");
+
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::RequestPreVote { rpc, tx }, rx).await
+    }
+
     /// Stop admitting leader operations and issue an exact planned handoff.
     ///
     /// The application delivers the returned request through its authenticated

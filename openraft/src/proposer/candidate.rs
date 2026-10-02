@@ -82,6 +82,11 @@ where
         self.last_log_id.as_ref()
     }
 
+    /// The time at which this voting round started.
+    pub(crate) fn starting_time(&self) -> InstantOf<C> {
+        self.starting_time
+    }
+
     pub(crate) fn progress(&self) -> &VecProgress<C::NodeId, bool, bool, QS> {
         &self.progress
     }
