@@ -13,3 +13,4 @@ mod t11_elect_seize_leadership;
 mod t13_elect_while_leader;
 mod t20_lease_and_timeout_overlap;
 mod t21_pre_vote;
+mod t22_one_way_isolation;
