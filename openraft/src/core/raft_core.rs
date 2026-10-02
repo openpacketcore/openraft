@@ -337,7 +337,8 @@ where
 
         let my_id = self.id.clone();
         let my_vote = self.engine.state.vote_ref().clone();
-        let ttl = Duration::from_millis(self.config.heartbeat_interval);
+        // Leadership is confirmed with heartbeats, each bounded by the AppendEntries deadline.
+        let ttl = self.config.append_entries_timeout();
         let eff_mem = self.engine.state.membership_state.effective().clone();
         let core_tx = self.tx_notify.clone();
 
@@ -348,7 +349,7 @@ where
             return;
         }
 
-        // Spawn parallel requests, all with the standard timeout for heartbeats.
+        // Spawn parallel requests, all with the AppendEntries deadline.
         let mut pending = FuturesUnordered::new();
 
         let voter_progresses = {

@@ -507,14 +507,18 @@ where
         };
 
         // Send the payload.
+        // AppendEntries, heartbeats included, has its own deadline. Heartbeats are still scheduled
+        // every heartbeat interval; a request that is not answered within the heartbeat interval is
+        // not abandoned before this deadline.
+        let the_timeout = self.config.append_entries_timeout();
+
         tracing::debug!(
             payload=%payload.summary(),
             now = debug(leader_time),
             "start sending append_entries, timeout: {:?}",
-            self.config.heartbeat_interval
+            the_timeout
         );
 
-        let the_timeout = Duration::from_millis(self.config.heartbeat_interval);
         let option = RPCOption::new(the_timeout);
         let res = C::timeout(the_timeout, self.network.append_entries(payload, option)).await;
 
