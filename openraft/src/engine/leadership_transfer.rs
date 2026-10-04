@@ -35,6 +35,7 @@ impl<C: RaftTypeConfig> Engine<C> {
             None
         };
         self.candidate = None;
+        self.pre_vote_rounds.clear();
         self.prepared_shutdown = Some(PreparedShutdown {
             handoff: handoff.clone(),
         });

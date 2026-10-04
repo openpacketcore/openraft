@@ -14,7 +14,9 @@ pub enum ConfigError {
     #[error("max_payload_entries must be > 0")]
     MaxPayloadIs0,
 
-    #[error("election_timeout_min({election_timeout_min}) must be > heartbeat_interval({heartbeat_interval})")]
+    #[error(
+        "election_timeout_min({election_timeout_min}) must be > heartbeat_interval({heartbeat_interval}) * 3 / 2, the interval at which a leader sends heartbeats"
+    )]
     ElectionTimeoutLTHeartBeat {
         election_timeout_min: u64,
         heartbeat_interval: u64,

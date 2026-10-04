@@ -74,6 +74,11 @@ async fn heartbeat_reject_vote() -> Result<()> {
 
     tracing::info!(log_index, "--- disable heartbeat, vote request will be granted");
     {
+        // A follower campaigns as soon as both its lease and its election timeout expire. Keep the
+        // followers from campaigning so that only the expired lease is observed here.
+        for id in [1, 2] {
+            router.get_raft_handle(&id)?.runtime_config().elect(false);
+        }
         node0.runtime_config().heartbeat(false);
         sleep(Duration::from_millis(1500)).await;
 

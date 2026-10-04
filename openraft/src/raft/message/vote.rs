@@ -91,3 +91,30 @@ where NID: NodeId
         )
     }
 }
+
+/// The outcome of a Pre-Vote RPC, as a network reports it.
+///
+/// See [`RaftNetwork::pre_vote()`](`crate::network::RaftNetwork::pre_vote`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize), serde(bound = ""))]
+pub enum PreVoteReply<NID: NodeId> {
+    /// The target answered whether it would grant the vote.
+    Answered(VoteResponse<NID>),
+
+    /// The target is not positively known to answer Pre-Vote, so nothing was sent to it.
+    ///
+    /// Such a target can still grant a vote, so the node runs the classic election for this
+    /// campaign instead of a Pre-Vote round that could never reach a quorum without it.
+    Unsupported,
+}
+
+impl<NID> fmt::Display for PreVoteReply<NID>
+where NID: NodeId
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Answered(resp) => write!(f, "Answered{}", resp),
+            Self::Unsupported => write!(f, "Unsupported"),
+        }
+    }
+}

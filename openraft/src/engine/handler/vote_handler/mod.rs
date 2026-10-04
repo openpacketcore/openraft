@@ -4,6 +4,7 @@ use crate::core::raft_msg::ResultSender;
 use crate::engine::handler::leader_handler::LeaderHandler;
 use crate::engine::handler::replication_handler::ReplicationHandler;
 use crate::engine::handler::server_state_handler::ServerStateHandler;
+use crate::engine::pre_vote_rounds::PreVoteRounds;
 use crate::engine::Command;
 use crate::engine::EngineConfig;
 use crate::engine::EngineOutput;
@@ -40,6 +41,7 @@ where C: RaftTypeConfig
     pub(crate) output: &'st mut EngineOutput<C>,
     pub(crate) leader: &'st mut LeaderState<C>,
     pub(crate) candidate: &'st mut CandidateState<C>,
+    pub(crate) pre_vote_rounds: &'st mut PreVoteRounds<C>,
 }
 
 impl<C> VoteHandler<'_, C>
@@ -117,6 +119,11 @@ where C: RaftTypeConfig
         // Update vote related timer and lease.
 
         tracing::debug!(now = debug(C::now()), "{}", func_name!());
+
+        // An accepted vote, including a heartbeat from the current leader, ends every open Pre-Vote
+        // round: their outcome no longer reflects this node's view of the cluster. The periodic
+        // re-evaluation of the server state does not, because it changes no vote.
+        self.pre_vote_rounds.clear();
 
         self.update_internal_server_state();
 

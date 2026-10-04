@@ -117,6 +117,10 @@ pub struct Config {
     pub cluster_name: String,
 
     /// The minimum election timeout in milliseconds
+    ///
+    /// It must exceed three halves of `heartbeat_interval`, the interval at which a leader sends
+    /// heartbeats, and should be at least twice that so one late heartbeat does not start an
+    /// election. It is also the follower's leader lease.
     #[clap(long, default_value = "150")]
     pub election_timeout_min: u64,
 
@@ -127,6 +131,17 @@ pub struct Config {
     /// The heartbeat interval in milliseconds at which leaders will send heartbeats to followers
     #[clap(long, default_value = "50")]
     pub heartbeat_interval: u64,
+
+    /// The deadline of one AppendEntries RPC in milliseconds.
+    ///
+    /// It bounds every AppendEntries RPC a leader sends: log replication, heartbeats and the
+    /// heartbeats that confirm leadership for a linearizable read. Heartbeats are still sent every
+    /// `heartbeat_interval`, so a follower may take longer than one heartbeat interval to answer
+    /// without its request being abandoned and resent. It must be positive.
+    ///
+    /// When unset, the deadline is `heartbeat_interval`.
+    #[clap(long)]
+    pub append_entries_timeout: Option<u64>,
 
     /// The timeout for sending then installing the last snapshot segment,
     /// in millisecond. It is also used as the timeout for sending a non-last segment, if
@@ -243,12 +258,38 @@ pub struct Config {
            default_missing_value = "true"
     )]
     pub enable_elect: bool,
+
+    /// Whether a follower runs a Pre-Vote round before it increments its term and starts a real
+    /// election.
+    ///
+    /// When enabled, a voter whose election timer fires asks the other voters whether they *would*
+    /// grant it a vote at `term + 1`, without persisting a vote or changing its term. Only when a
+    /// quorum would grant does it start the real election. A voter that cannot currently win, for
+    /// example one that is cut off from the others, restarted, or behind on the log, therefore
+    /// does not raise its term and depose a healthy leader once it can be reached again.
+    ///
+    /// Pre-Vote uses the separate
+    /// [`RaftNetwork::pre_vote`](`crate::network::RaftNetwork::pre_vote`) RPC. A voter that the
+    /// network does not know to answer it, including every voter of a network that does not
+    /// implement it, makes the campaign run the classic election instead; a transport error is
+    /// never counted as a grant.
+    ///
+    /// `None`, the default, is treated as disabled.
+    // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
+    // https://github.com/clap-rs/clap/discussions/4374
+    #[clap(long,
+           action = clap::ArgAction::Set,
+           num_args = 0..=1,
+           default_missing_value = "true"
+    )]
+    pub enable_pre_vote: Option<bool>,
 }
 
 /// Updatable config for a raft runtime.
 pub(crate) struct RuntimeConfig {
     pub(crate) enable_heartbeat: AtomicBool,
     pub(crate) enable_elect: AtomicBool,
+    pub(crate) enable_pre_vote: AtomicBool,
 }
 
 impl RuntimeConfig {
@@ -256,6 +297,7 @@ impl RuntimeConfig {
         Self {
             enable_heartbeat: AtomicBool::from(config.enable_heartbeat),
             enable_elect: AtomicBool::from(config.enable_elect),
+            enable_pre_vote: AtomicBool::from(config.get_enable_pre_vote()),
         }
     }
 }
@@ -270,6 +312,21 @@ impl Config {
     /// Generate a new random election timeout within the configured min & max.
     pub fn new_rand_election_timeout<RT: AsyncRuntime>(&self) -> u64 {
         RT::thread_rng().gen_range(self.election_timeout_min..self.election_timeout_max)
+    }
+
+    /// Whether a voter runs a Pre-Vote round before it starts a real election.
+    ///
+    /// `None` is treated as disabled.
+    pub(crate) fn get_enable_pre_vote(&self) -> bool {
+        self.enable_pre_vote.unwrap_or(false)
+    }
+
+    /// Get the deadline of one AppendEntries RPC.
+    ///
+    /// It is [`append_entries_timeout`](Self::append_entries_timeout) when set, otherwise
+    /// [`heartbeat_interval`](Self::heartbeat_interval).
+    pub fn append_entries_timeout(&self) -> Duration {
+        Duration::from_millis(self.append_entries_timeout.unwrap_or(self.heartbeat_interval))
     }
 
     /// Get the timeout for sending and installing the last snapshot segment.
@@ -311,7 +368,10 @@ impl Config {
             });
         }
 
-        if self.election_timeout_min <= self.heartbeat_interval {
+        // A leader sends heartbeats on its engine tick, every three halves of the heartbeat
+        // interval. A follower campaigns once its sampled election timeout expires, so the
+        // smallest timeout has to outlast that tick.
+        if self.election_timeout_min <= self.heartbeat_interval.saturating_mul(3) / 2 {
             return Err(ConfigError::ElectionTimeoutLTHeartBeat {
                 election_timeout_min: self.election_timeout_min,
                 heartbeat_interval: self.heartbeat_interval,

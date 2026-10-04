@@ -43,6 +43,7 @@ use openraft::raft::AppendEntriesResponse;
 use openraft::raft::ClientWriteResponse;
 use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
+use openraft::raft::PreVoteReply;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::storage::Adaptor;
@@ -266,6 +267,16 @@ pub struct TypedRaftRouter {
     /// Count of RPCs sent.
     rpc_count: Arc<Mutex<HashMap<RPCTypes, u64>>>,
 
+    /// Nodes that cannot answer Pre-Vote, such as voters of a release without it. A Pre-Vote to
+    /// one of them is reported as unsupported without reaching it.
+    pre_vote_unsupported: Arc<Mutex<BTreeSet<MemNodeId>>>,
+
+    /// How long the reply to a Pre-Vote sent to a node takes to arrive, per target.
+    pre_vote_reply_delay: Arc<Mutex<BTreeMap<MemNodeId, Duration>>>,
+
+    /// The Raft config of a node that does not use the router's config.
+    node_configs: Arc<Mutex<BTreeMap<MemNodeId, Arc<Config>>>>,
+
     /// A hook function to be called when before an RPC is sent to target node.
     rpc_pre_hook: Arc<Mutex<HashMap<RPCTypes, RPCPreHook>>>,
 
@@ -274,6 +285,9 @@ pub struct TypedRaftRouter {
 
     /// Targets whose AppendEntries RPC never returns, emulating a hung follower.
     blocked_rpc: Arc<Mutex<BTreeSet<MemNodeId>>>,
+
+    /// The target and hard deadline of every AppendEntries RPC, in the order they are sent.
+    append_entries_deadlines: Arc<Mutex<Vec<(MemNodeId, Duration)>>>,
 }
 
 /// Default `RaftRouter` for memstore.
@@ -309,9 +323,13 @@ impl Builder {
             send_delay: Arc::new(AtomicU64::new(send_delay)),
             append_entries_quota: Arc::new(Mutex::new(None)),
             rpc_count: Default::default(),
+            pre_vote_unsupported: Default::default(),
+            pre_vote_reply_delay: Default::default(),
+            node_configs: Default::default(),
             rpc_pre_hook: Default::default(),
             rpc_observers: Default::default(),
             blocked_rpc: Default::default(),
+            append_entries_deadlines: Default::default(),
         }
     }
 }
@@ -377,6 +395,11 @@ impl TypedRaftRouter {
 
     pub fn get_rpc_count(&self) -> HashMap<RPCTypes, u64> {
         self.rpc_count.lock().unwrap().clone()
+    }
+
+    /// The target and hard deadline of every AppendEntries RPC sent so far, in sending order.
+    pub fn append_entries_deadlines(&self) -> Vec<(MemNodeId, Duration)> {
+        self.append_entries_deadlines.lock().unwrap().clone()
     }
 
     /// Create a cluster: 0 is the initial leader, others are voters and learners
@@ -494,8 +517,15 @@ impl TypedRaftRouter {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
+    /// Create node `id` with `config` instead of the router's config, such as a node of another
+    /// release with other timers. It applies to nodes created afterwards.
+    pub fn set_node_config(&self, id: MemNodeId, config: Arc<Config>) {
+        self.node_configs.lock().unwrap().insert(id, config);
+    }
+
     pub async fn new_raft_node_with_sto(&mut self, id: MemNodeId, log_store: MemLogStore, sm: MemStateMachine) {
-        let node = Raft::new(id, self.config.clone(), self.clone(), log_store.clone(), sm.clone()).await.unwrap();
+        let config = self.node_configs.lock().unwrap().get(&id).cloned().unwrap_or_else(|| self.config.clone());
+        let node = Raft::new(id, config, self.clone(), log_store.clone(), sm.clone()).await.unwrap();
         let mut rt = self.nodes.lock().unwrap();
         rt.insert(id, (node, log_store, sm));
     }
@@ -557,6 +587,33 @@ impl TypedRaftRouter {
     }
 
     /// Set whether to emit a specified rpc error when sending to/receiving from a node.
+    /// Report every Pre-Vote to `id` as unsupported without reaching it, as a network does for a
+    /// voter of a release without Pre-Vote.
+    /// Delay the reply to every Pre-Vote sent to `id` by `delay`, or remove the delay with `None`.
+    ///
+    /// A target that answers is asked at once and its answer is held back; an answer reported as
+    /// unsupported is held back the same way.
+    pub fn set_pre_vote_reply_delay(&self, id: MemNodeId, delay: Option<Duration>) {
+        let mut delays = self.pre_vote_reply_delay.lock().unwrap();
+        match delay {
+            Some(delay) => {
+                delays.insert(id, delay);
+            }
+            None => {
+                delays.remove(&id);
+            }
+        }
+    }
+
+    pub fn set_pre_vote_unsupported(&self, id: MemNodeId, unsupported: bool) {
+        let mut nodes = self.pre_vote_unsupported.lock().unwrap();
+        if unsupported {
+            nodes.insert(id);
+        } else {
+            nodes.remove(&id);
+        }
+    }
+
     pub fn set_rpc_failure(&self, id: MemNodeId, dir: Direction, rpc_error_type: Option<RPCErrorType>) {
         let mut fails = self.fail_rpc.lock().unwrap();
         if let Some(rpc_error_type) = rpc_error_type {
@@ -1051,11 +1108,12 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
     async fn append_entries(
         &mut self,
         mut rpc: AppendEntriesRequest<MemConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
         let from_id = rpc.vote.leader_id().voted_for().unwrap();
 
         tracing::debug!("append_entries to id={} {}", self.target, rpc.summary());
+        self.owner.append_entries_deadlines.lock().unwrap().push((self.target, option.hard_ttl()));
         self.owner.count_rpc(RPCTypes::AppendEntries);
         self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
         self.owner.emit_rpc_error(from_id, self.target)?;
@@ -1153,6 +1211,39 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
 
         Ok(resp)
+    }
+
+    /// Send a Pre-Vote RPC to the target Raft node.
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<MemNodeId>,
+        _option: RPCOption,
+    ) -> Result<PreVoteReply<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
+        let from_id = rpc.vote.leader_id().voted_for().unwrap();
+
+        self.owner.count_rpc(RPCTypes::Vote);
+        self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
+        self.owner.emit_rpc_error(from_id, self.target)?;
+        self.owner.rand_send_delay().await;
+
+        let reply_delay = self.owner.pre_vote_reply_delay.lock().unwrap().get(&self.target).copied();
+
+        let reply = if self.owner.pre_vote_unsupported.lock().unwrap().contains(&self.target) {
+            // Send nothing to a voter that cannot answer Pre-Vote.
+            PreVoteReply::Unsupported
+        } else {
+            let node = self.owner.get_raft_handle(&self.target)?;
+
+            let resp = node.pre_vote(rpc).await;
+            let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
+            PreVoteReply::Answered(resp)
+        };
+
+        if let Some(delay) = reply_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        Ok(reply)
     }
 }
 

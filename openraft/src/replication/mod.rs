@@ -25,6 +25,7 @@ pub(crate) use response::Response;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tracing_futures::Instrument;
 
@@ -78,6 +79,9 @@ where C: RaftTypeConfig
 
     /// The channel used for communicating with the replication task.
     pub(crate) tx_repl: mpsc::UnboundedSender<Replicate<C>>,
+
+    /// Dropped when the stream is closed, which makes an in-flight AppendEntries give up at once.
+    pub(crate) tx_close: watch::Sender<()>,
 }
 
 /// A task responsible for sending replication events to a target follower in the Raft cluster.
@@ -103,6 +107,9 @@ where
 
     /// A channel for receiving events from the RaftCore and snapshot transmitting task.
     rx_event: mpsc::UnboundedReceiver<Replicate<C>>,
+
+    /// Closed when the RaftCore closes this stream; see [`ReplicationHandle::tx_close`].
+    rx_close: watch::Receiver<()>,
 
     /// A weak reference to the Sender for the separate sending-snapshot task to send callback.
     ///
@@ -187,6 +194,7 @@ where
 
         // other component to ReplicationStream
         let (tx_event, rx_event) = mpsc::unbounded_channel();
+        let (tx_close, rx_close) = watch::channel(());
 
         let this = Self {
             target,
@@ -202,6 +210,7 @@ where
             matching,
             tx_raft_core,
             rx_event,
+            rx_close,
             weak_tx_event: tx_event.downgrade(),
             next_action: None,
             entries_hint: Default::default(),
@@ -212,6 +221,7 @@ where
         ReplicationHandle {
             join_handle,
             tx_repl: tx_event,
+            tx_close,
         }
     }
 
@@ -507,16 +517,30 @@ where
         };
 
         // Send the payload.
+        // AppendEntries, heartbeats included, has its own deadline. Heartbeats are still scheduled
+        // every heartbeat interval; a request that is not answered within the heartbeat interval is
+        // not abandoned before this deadline.
+        let the_timeout = self.config.append_entries_timeout();
+
         tracing::debug!(
             payload=%payload.summary(),
             now = debug(leader_time),
             "start sending append_entries, timeout: {:?}",
-            self.config.heartbeat_interval
+            the_timeout
         );
 
-        let the_timeout = Duration::from_millis(self.config.heartbeat_interval);
         let option = RPCOption::new(the_timeout);
-        let res = C::timeout(the_timeout, self.network.append_entries(payload, option)).await;
+        let res = select! {
+            res = C::timeout(the_timeout, self.network.append_entries(payload, option)) => res,
+            // Nobody waits for the answer of a closed stream, while the RaftCore may wait to join
+            // this stream before it answers a vote. Give up the request at once instead of at its
+            // deadline. The log entries were already read, so no storage operation is abandoned.
+            _ = self.rx_close.changed() => {
+                return Err(ReplicationError::Closed(ReplicationClosed::new(
+                    "RaftCore closed replication during AppendEntries",
+                )));
+            }
+        };
 
         tracing::debug!("append_entries res: {:?}", res);
 

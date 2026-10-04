@@ -181,7 +181,7 @@ fn test_default_election_timer_bounds_are_coherent() {
 
     assert!(minimum <= config.timer_config.election_timeout);
     assert!(config.timer_config.election_timeout < maximum);
-    assert_eq!(maximum, config.timer_config.leader_lease);
+    assert_eq!(minimum, config.timer_config.leader_lease);
     assert!(config.timer_config.smaller_log_timeout > maximum);
 }
 
@@ -193,7 +193,7 @@ fn test_election_timeout_is_resampled_for_every_campaign() {
     let leader_lease = config.timer_config.leader_lease;
     let smaller_log_timeout = config.timer_config.smaller_log_timeout;
     assert_eq!(Duration::from_millis(100), config.timer_config.election_timeout);
-    assert_eq!(Duration::from_millis(104), leader_lease);
+    assert_eq!(Duration::from_millis(100), leader_lease);
     assert_eq!(Duration::from_millis(208), smaller_log_timeout);
 
     let mut engine = scripted_engine(1, config);
@@ -206,6 +206,42 @@ fn test_election_timeout_is_resampled_for_every_campaign() {
         assert_eq!(smaller_log_timeout, engine.config.timer_config.smaller_log_timeout);
     }
     assert_eq!(Vote::new(3, 1), *engine.state.vote_ref());
+    assert_rng_script_exhausted();
+}
+
+#[test]
+fn test_leased_election_wait_is_the_longer_of_lease_and_timeout() {
+    let mut timer = crate::engine::time_state::Config {
+        election_timeout: Duration::from_millis(103),
+        smaller_log_timeout: Duration::from_millis(208),
+        leader_lease: Duration::from_millis(100),
+    };
+    assert_eq!(Duration::from_millis(103), timer.election_wait(true));
+    assert_eq!(Duration::from_millis(103), timer.election_wait(false));
+
+    // A lease longer than the sampled timeout bounds the wait; it is never added to it.
+    timer.leader_lease = Duration::from_millis(150);
+    assert_eq!(Duration::from_millis(150), timer.election_wait(true));
+    assert_eq!(Duration::from_millis(103), timer.election_wait(false));
+}
+
+#[test]
+fn test_every_sampled_election_timeout_covers_the_lease() {
+    set_rng_script([0, 1_u64 << 62, 1_u64 << 63, 3_u64 << 62]);
+
+    let config = EngineConfig::new::<ScriptedRuntime>(1, &election_config());
+    assert_eq!(Duration::from_millis(100), config.timer_config.leader_lease);
+
+    let mut engine = scripted_engine(1, config);
+    let timer = &engine.config.timer_config;
+    assert_eq!(timer.election_timeout, timer.election_wait(true));
+    for _ in 0..3 {
+        engine.elect();
+        // The wait follows each newly sampled timeout, so campaigns stay randomized.
+        let timer = &engine.config.timer_config;
+        assert!(timer.leader_lease <= timer.election_timeout);
+        assert_eq!(timer.election_timeout, timer.election_wait(true));
+    }
     assert_rng_script_exhausted();
 }
 

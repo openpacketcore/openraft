@@ -219,6 +219,23 @@ where
     pub(crate) _p: PhantomData<SM>,
 }
 
+/// Whether [`RaftCore::spawn_parallel_vote_requests`] sends Vote requests or the Pre-Vote
+/// requests of one round.
+#[derive(Clone, Copy, Debug)]
+enum VoteRequestKind {
+    Vote,
+    PreVote { round: u64 },
+}
+
+impl VoteRequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            VoteRequestKind::Vote => "vote",
+            VoteRequestKind::PreVote { .. } => "pre-vote",
+        }
+    }
+}
+
 impl<C, N, LS, SM> RaftCore<C, N, LS, SM>
 where
     C: RaftTypeConfig,
@@ -337,7 +354,8 @@ where
 
         let my_id = self.id.clone();
         let my_vote = self.engine.state.vote_ref().clone();
-        let ttl = Duration::from_millis(self.config.heartbeat_interval);
+        // Leadership is confirmed with heartbeats, each bounded by the AppendEntries deadline.
+        let ttl = self.config.append_entries_timeout();
         let eff_mem = self.engine.state.membership_state.effective().clone();
         let core_tx = self.tx_notify.clone();
 
@@ -348,7 +366,7 @@ where
             return;
         }
 
-        // Spawn parallel requests, all with the standard timeout for heartbeats.
+        // Spawn parallel requests, all with the AppendEntries deadline.
         let mut pending = FuturesUnordered::new();
 
         let voter_progresses = {
@@ -910,8 +928,15 @@ where
             tracing::debug!(%target, "retire replication");
             // Close every sender before awaiting any task. A removed stream may still own
             // a log read or a snapshot, even though its progress notifications are stale.
-            drop(stream.tx_repl);
-            self.retired_replications.push(stream.join_handle);
+            // Closing also makes an in-flight AppendEntries give up at once.
+            let ReplicationHandle {
+                join_handle,
+                tx_repl,
+                tx_close,
+            } = stream;
+            drop(tx_repl);
+            drop(tx_close);
+            self.retired_replications.push(join_handle);
         }
     }
 
@@ -1172,9 +1197,12 @@ where
         Ok(at_most)
     }
 
-    /// Spawn parallel vote requests to all cluster members.
+    /// Spawn parallel Vote or Pre-Vote requests, selected by `kind`, to all other voters.
+    ///
+    /// Only a response counts toward a quorum. A transport error, including an unreachable peer,
+    /// is never a grant: otherwise a voter that is cut off would assemble a Pre-Vote quorum.
     #[tracing::instrument(level = "trace", skip_all, fields(vote=vote_req.summary()))]
-    async fn spawn_parallel_vote_requests(&mut self, vote_req: &VoteRequest<C::NodeId>) {
+    async fn spawn_parallel_vote_requests(&mut self, vote_req: &VoteRequest<C::NodeId>, kind: VoteRequestKind) {
         let members = self.engine.state.membership_state.effective().voter_ids();
 
         let vote = vote_req.vote.clone();
@@ -1204,37 +1232,64 @@ where
                     let vote = vote.clone();
 
                     async move {
-                        let tm_res = C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await;
-                        let res = match tm_res {
-                            Ok(res) => res,
-
-                            Err(_timeout) => {
-                                let timeout_err = Timeout {
-                                    action: RPCTypes::Vote,
-                                    id,
-                                    target: target.clone(),
-                                    timeout: ttl,
-                                };
-                                tracing::error!({error = %timeout_err, target = display(&target)}, "timeout");
-                                return;
+                        let timeout_err = || Timeout {
+                            action: RPCTypes::Vote,
+                            id: id.clone(),
+                            target: target.clone(),
+                            timeout: ttl,
+                        };
+                        let notify = match kind {
+                            VoteRequestKind::Vote => {
+                                match C::AsyncRuntime::timeout(ttl, client.vote(req, option)).await {
+                                    Ok(Ok(resp)) => Notify::VoteResponse {
+                                        target: target.clone(),
+                                        resp,
+                                        sender_vote: vote,
+                                    },
+                                    Ok(Err(err)) => {
+                                        tracing::error!({error=%err, target=display(&target)}, "while requesting vote");
+                                        return;
+                                    }
+                                    Err(_timeout) => {
+                                        tracing::error!(
+                                            {error = %timeout_err(), target = display(&target)},
+                                            "timeout while requesting vote"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            VoteRequestKind::PreVote { round } => {
+                                match C::AsyncRuntime::timeout(ttl, client.pre_vote(req, option)).await {
+                                    Ok(Ok(reply)) => Notify::PreVoteResponse {
+                                        target: target.clone(),
+                                        reply,
+                                        round,
+                                    },
+                                    Ok(Err(err)) => {
+                                        tracing::error!(
+                                            {error=%err, target=display(&target)},
+                                            "while requesting pre-vote"
+                                        );
+                                        return;
+                                    }
+                                    Err(_timeout) => {
+                                        tracing::error!(
+                                            {error = %timeout_err(), target = display(&target)},
+                                            "timeout while requesting pre-vote"
+                                        );
+                                        return;
+                                    }
+                                }
                             }
                         };
-
-                        match res {
-                            Ok(resp) => {
-                                let _ = tx.send(Notify::VoteResponse {
-                                    target,
-                                    resp,
-                                    sender_vote: vote,
-                                });
-                            }
-                            Err(err) => tracing::error!({error=%err, target=display(&target)}, "while requesting vote"),
-                        }
+                        let _ = tx.send(notify);
                     }
                 }
                 .instrument(tracing::debug_span!(
                     parent: &Span::current(),
                     "send_vote_req",
+                    kind = kind.as_str(),
                     target = display(&target)
                 )),
             );
@@ -1246,6 +1301,18 @@ where
         tracing::info!(req = display(req.summary()), func = func_name!());
 
         let resp = self.engine.handle_vote_req(req);
+        self.engine.output.push_command(Command::Respond {
+            when: None,
+            resp: Respond::new(Ok(resp), tx),
+        });
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(super) fn handle_pre_vote_request(&mut self, req: VoteRequest<C::NodeId>, tx: VoteTx<C>) {
+        tracing::info!(req = display(req.summary()), func = func_name!());
+
+        // A Pre-Vote persists nothing, so there is no IO to wait for.
+        let resp = self.engine.handle_pre_vote_req(req);
         self.engine.output.push_command(Command::Respond {
             when: None,
             resp: Respond::new(Ok(resp), tx),
@@ -1282,6 +1349,11 @@ where
                 );
 
                 self.handle_vote_request(rpc, tx);
+            }
+            RaftMsg::RequestPreVote { rpc, tx } => {
+                tracing::info!(pre_vote_request = display(&rpc), "received RaftMsg::RequestPreVote");
+
+                self.handle_pre_vote_request(rpc, tx);
             }
             RaftMsg::BeginReceivingSnapshot { tx } => {
                 self.engine.handle_begin_receiving_snapshot(tx);
@@ -1388,6 +1460,20 @@ where
                 if self.does_vote_match(&sender_vote, "VoteResponse") {
                     self.engine.handle_vote_resp(target, resp);
                 }
+            }
+
+            Notify::PreVoteResponse { target, reply, round } => {
+                tracing::info!(
+                    reply = display(&reply),
+                    target = display(&target),
+                    round,
+                    "received Notify::PreVoteResponse: {}",
+                    func_name!()
+                );
+
+                // Rounds in one term propose the same vote, so only the round identifier tells a
+                // delayed response from a current one. The engine ignores any other round.
+                self.engine.handle_pre_vote_resp(target, round, reply);
             }
 
             Notify::HigherVote {
@@ -1619,7 +1705,9 @@ where
             return;
         }
 
-        if self.engine.state.membership_state.effective().voter_ids().count() == 1 {
+        let voter_count = self.engine.state.membership_state.effective().voter_ids().count();
+
+        if voter_count == 1 {
             if self.engine.candidate_ref().is_some() {
                 tracing::debug!("skip election, single voter already has an active election in progress");
                 return;
@@ -1632,11 +1720,9 @@ where
             let utime = self.engine.state.vote_last_modified();
             let timer_config = &self.engine.config.timer_config;
 
-            let mut election_timeout = if current_vote.is_committed() {
-                timer_config.leader_lease + timer_config.election_timeout
-            } else {
-                timer_config.election_timeout
-            };
+            // The leader lease and the sampled election timeout run in parallel from the last
+            // update of a committed vote: campaign after the longer of the two.
+            let mut election_timeout = timer_config.election_wait(current_vote.is_committed());
 
             if self.engine.is_there_greater_log() {
                 election_timeout += timer_config.smaller_log_timeout;
@@ -1659,11 +1745,40 @@ where
             tracing::info!("election timeout passed, check if it is a voter for election");
         }
 
+        // Pre-Vote applies to multiple voters only: a single voter always wins its own Pre-Vote.
+        // A voter that cannot answer it makes this node run the classic election instead.
+        let pre_vote = self.runtime_config.enable_pre_vote.load(Ordering::Relaxed) && voter_count > 1;
+
+        if pre_vote {
+            // A Pre-Vote round does not update the vote, so the expired election timer would
+            // restart it on every tick. A round that awaits replies no voter has rejected stays the
+            // latest until they are due, one Pre-Vote deadline after it started: a slow reply must
+            // still reach it. A rejected round is retried after the width of the election-timeout
+            // window, while it stays open for late grants.
+            //
+            // After an unplanned leader loss, a round fails while a voter's lease still runs, and
+            // every lease runs out within the minimum election timeout of the loss. A survivor's
+            // first round starts within the maximum election timeout and a tick of its last leader
+            // contact. When every surviving voter answers within the window's width, each retry
+            // starts within that width and a tick of the round before, so the survivor with the
+            // most up-to-date log starts a round that no lease rejects within the maximum election
+            // timeout and a tick of the loss.
+            if !self.engine.pre_vote_round_due(now) {
+                tracing::debug!("a Pre-Vote round is already in flight");
+                return;
+            }
+        }
+
         // Every time elect, reset this flag.
         self.engine.reset_greater_log();
 
-        tracing::info!("do trigger election");
-        self.engine.elect();
+        if pre_vote {
+            tracing::info!("do trigger Pre-Vote");
+            self.engine.pre_elect();
+        } else {
+            tracing::info!("do trigger election");
+            self.engine.elect();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -1867,7 +1982,10 @@ where
                 }
             }
             Command::SendVote { vote_req } => {
-                self.spawn_parallel_vote_requests(&vote_req).await;
+                self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::Vote).await;
+            }
+            Command::SendPreVote { vote_req, round } => {
+                self.spawn_parallel_vote_requests(&vote_req, VoteRequestKind::PreVote { round }).await;
             }
             Command::ReplicateCommitted { committed } => {
                 for node in self.replications.values() {

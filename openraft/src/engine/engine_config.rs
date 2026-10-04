@@ -65,7 +65,10 @@ impl<NID: NodeId> EngineConfig<NID> {
             timer_config: time_state::Config {
                 election_timeout,
                 smaller_log_timeout: Duration::from_millis(config.election_timeout_max * 2),
-                leader_lease: Duration::from_millis(config.election_timeout_max),
+                // A follower rejects other candidates for the minimum election timeout after its
+                // last leader contact (Raft dissertation 4.2.3). Every sampled election timeout
+                // covers this lease, so the lease never delays a campaign.
+                leader_lease: Duration::from_millis(config.election_timeout_min),
             },
         }
     }

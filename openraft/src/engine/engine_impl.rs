@@ -20,6 +20,7 @@ use crate::engine::handler::server_state_handler::ServerStateHandler;
 use crate::engine::handler::snapshot_handler::SnapshotHandler;
 use crate::engine::handler::vote_handler::VoteHandler;
 use crate::engine::leadership_transfer::PreparedShutdown;
+use crate::engine::pre_vote_rounds::PreVoteRounds;
 use crate::engine::Command;
 use crate::engine::EngineOutput;
 use crate::engine::Respond;
@@ -37,12 +38,14 @@ use crate::proposer::LeaderQuorumSet;
 use crate::proposer::LeaderState;
 use crate::raft::responder::Responder;
 use crate::raft::AppendEntriesResponse;
+use crate::raft::PreVoteReply;
 use crate::raft::SnapshotResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::raft_state::LogStateReader;
 use crate::raft_state::RaftState;
 use crate::summary::MessageSummary;
+use crate::type_config::alias::InstantOf;
 use crate::type_config::alias::ResponderOf;
 use crate::type_config::alias::SnapshotDataOf;
 use crate::type_config::TypeConfigExt;
@@ -91,6 +94,13 @@ where C: RaftTypeConfig
     /// without losing leadership status.
     pub(crate) candidate: CandidateState<C>,
 
+    /// The Pre-Vote rounds that may still collect replies; see [`PreVoteRounds`].
+    ///
+    /// Their vote is the hypothetical next-term vote this node would campaign with. It is never
+    /// persisted, and every round ends once a real election starts or this node follows another
+    /// vote.
+    pub(crate) pre_vote_rounds: PreVoteRounds<C>,
+
     /// Retirement is irreversible for this engine instance, including after a new vote.
     pub(crate) prepared_shutdown: Option<PreparedShutdown<C::NodeId>>,
 
@@ -111,6 +121,7 @@ where C: RaftTypeConfig
             seen_greater_log: false,
             leader: None,
             candidate: None,
+            pre_vote_rounds: PreVoteRounds::default(),
             prepared_shutdown: None,
             output: EngineOutput::new(4096),
         }
@@ -135,6 +146,25 @@ where C: RaftTypeConfig
         ));
 
         self.candidate.as_mut().unwrap()
+    }
+
+    /// Open a new Pre-Vote round and return its identifier.
+    ///
+    /// Its quorum tracker is like [`new_candidate`](Self::new_candidate)'s, but `vote` is only the
+    /// hypothetical next-term vote of the round and is never persisted.
+    pub(crate) fn new_pre_vote_round(&mut self, vote: Vote<C::NodeId>) -> u64 {
+        let now = C::now();
+        let last_log_id = self.state.last_log_id().cloned();
+
+        let membership = self.state.membership_state.effective().membership();
+
+        self.pre_vote_rounds.open(Candidate::new(
+            now,
+            vote,
+            last_log_id,
+            membership.to_quorum_set(),
+            membership.learner_ids(),
+        ))
     }
 
     /// Create a default Engine for testing.
@@ -221,6 +251,9 @@ where C: RaftTypeConfig
     /// Start to elect this node as leader
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) fn elect(&mut self) {
+        // A real election supersedes every open Pre-Vote round.
+        self.pre_vote_rounds.clear();
+
         if self.prepared_shutdown.is_some() {
             return;
         }
@@ -256,8 +289,82 @@ where C: RaftTypeConfig
         self.server_state_handler().update_server_state_if_changed();
     }
 
+    /// Start a Pre-Vote round.
+    ///
+    /// Ask the voters whether a quorum *would* grant this node a vote at `term + 1`, without
+    /// changing local state: no term bump, no persisted vote and no server-state change. When a
+    /// quorum would grant, [`handle_pre_vote_resp`](Self::handle_pre_vote_resp) starts the real
+    /// [`elect`](Self::elect).
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) fn pre_elect(&mut self) {
+        if self.prepared_shutdown.is_some() || self.leader.is_some() {
+            return;
+        }
+
+        // A voter that a live leader serves does not start a round: every voter applying the same
+        // lease rule would reject it. Return before sampling a new timeout so nothing changes.
+        let lease = self.config.timer_config.leader_lease;
+        if self.state.vote_ref().is_committed() && !self.state.vote.lease_disabled() {
+            if let Some(utime) = self.state.vote_last_modified() {
+                if C::now() <= utime + lease {
+                    tracing::info!("skip pre-elect: the leader lease has not yet expired");
+                    return;
+                }
+            }
+        }
+
+        // A Pre-Vote does not advance the persisted vote timestamp, so a new round is gated by a
+        // newly sampled timeout, as a real campaign is.
+        self.config.resample_election_timeout::<C::AsyncRuntime>();
+
+        let new_term = self.state.vote.leader_id().term + 1;
+        let pre_vote = Vote::new(new_term, self.config.id.clone());
+
+        let round = self.new_pre_vote_round(pre_vote.clone());
+        let id = self.config.id.clone();
+        let pre_round = self.pre_vote_rounds.latest_mut().unwrap();
+        tracing::info!(
+            "{}, new Pre-Vote round {}: {}",
+            func_name!(),
+            round,
+            pre_round.candidate
+        );
+
+        let last_log_id = pre_round.candidate.last_log_id().cloned();
+
+        // A voter grants its own Pre-Vote. A single voter reaches a quorum at once and starts the
+        // real election without a round trip.
+        if pre_round.candidate.grant_by(&id) {
+            self.elect();
+            return;
+        }
+
+        self.output.push_command(Command::SendPreVote {
+            vote_req: VoteRequest::new(pre_vote, last_log_id),
+            round,
+        });
+    }
+
     pub(crate) fn candidate_ref(&self) -> Option<&Candidate<C, LeaderQuorumSet<C::NodeId>>> {
         self.candidate.as_ref()
+    }
+
+    /// The quorum tracker of the latest Pre-Vote round, if it is still open.
+    #[cfg(test)]
+    pub(crate) fn pre_candidate_ref(&self) -> Option<&Candidate<C, LeaderQuorumSet<C::NodeId>>> {
+        self.pre_vote_rounds.latest().map(|round| &round.candidate)
+    }
+
+    /// Whether a new Pre-Vote round may start at `now`; see [`PreVoteRounds`].
+    ///
+    /// The replies to a round are due one Pre-Vote deadline after it started: requests are
+    /// abandoned after `election_timeout_min`. A rejected round is retried after the width of the
+    /// election-timeout window.
+    pub(crate) fn pre_vote_round_due(&mut self, now: InstantOf<C>) -> bool {
+        let deadline = Duration::from_millis(self.config.election_timeout_min);
+        let window =
+            Duration::from_millis(self.config.election_timeout_max.saturating_sub(self.config.election_timeout_min));
+        self.pre_vote_rounds.next_round_due(now, window, deadline)
     }
 
     pub(crate) fn candidate_mut(&mut self) -> Option<&mut Candidate<C, LeaderQuorumSet<C::NodeId>>> {
@@ -328,6 +435,18 @@ where C: RaftTypeConfig
             }
         }
 
+        // A leader does not renew the lease on its own vote. While a quorum keeps acknowledging it,
+        // it rejects other candidates as its followers do. A planned leadership transfer releases
+        // this vote's lease, and its successor's vote is granted.
+        if !self.state.vote.lease_disabled() {
+            if let Some(leader) = self.leader.as_mut() {
+                if leader.is_lease_valid(now, lease) {
+                    tracing::info!("reject vote-request: the quorum-acknowledged leader lease has not yet expired");
+                    return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+                }
+            }
+        }
+
         // The first step is to check log. If the candidate has less log, nothing needs to be done.
 
         if req.last_log_id.as_ref() >= self.state.last_log_id() {
@@ -350,6 +469,22 @@ where C: RaftTypeConfig
 
         let res = self.vote_handler().update_vote(&req.vote);
 
+        if res.is_err() && req.last_log_id.as_ref() > self.state.last_log_id() && self.is_campaigning() {
+            // A candidate whose log is more up to date than this node's is refused only because
+            // this node voted for itself, which cannot win against that log. Its next
+            // campaign is in a later term; had this node campaigned again before it,
+            // that term would hold another self-vote, and so on. Defer the next
+            // campaign by the greater-log timeout from now, as after seeing a greater
+            // log in a vote response: the candidate's next campaign finds no
+            // new self-vote, and this node grants it.
+            tracing::info!(
+                req = display(req.summary()),
+                "defer the next campaign to a candidate with a greater log"
+            );
+            self.set_greater_log();
+            self.state.vote.touch(C::now());
+        }
+
         tracing::info!(
             req = display(req.summary()),
             result = debug(&res),
@@ -359,6 +494,150 @@ where C: RaftTypeConfig
         // Return the updated vote, this way the candidate knows which vote is granted, in case
         // the candidate's vote is changed after sending the vote request.
         VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), res.is_ok())
+    }
+
+    /// Handle a Pre-Vote request.
+    ///
+    /// Report whether this node *would* grant a vote for `req.vote`, judged by the same
+    /// leader-lease and last-log-id rules as [`handle_vote_req`](Self::handle_vote_req), but
+    /// without persisting any vote, changing the term or emitting any command.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn handle_pre_vote_req(&mut self, req: VoteRequest<C::NodeId>) -> VoteResponse<C::NodeId> {
+        let now = C::now();
+        let lease = self.config.timer_config.leader_lease;
+        let vote = self.state.vote_ref();
+
+        // Make default vote-last-modified a low enough value, that expires leader lease.
+        let vote_utime = self.state.vote_last_modified().unwrap_or_else(|| now - lease - Duration::from_millis(1));
+
+        tracing::info!(
+            req = display(req.summary()),
+            my_vote = display(vote.summary()),
+            my_last_log_id = display(self.state.last_log_id().summary()),
+            "Engine::handle_pre_vote_req"
+        );
+
+        // While a leader's lease is valid this node would not grant a vote.
+        if vote.is_committed() && !self.state.vote.lease_disabled() && now <= vote_utime + lease {
+            tracing::info!("reject pre-vote-request: leader lease has not yet expired");
+            return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+        }
+
+        // Nor would a leader that a quorum keeps acknowledging.
+        if !self.state.vote.lease_disabled() {
+            if let Some(leader) = self.leader.as_mut() {
+                if leader.is_lease_valid(now, lease) {
+                    tracing::info!("reject pre-vote-request: the quorum-acknowledged leader lease has not yet expired");
+                    return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+                }
+            }
+        }
+
+        if req.last_log_id.as_ref() >= self.state.last_log_id() {
+            // Ok
+        } else {
+            tracing::info!(
+                "reject pre-vote-request: by last_log_id: !(req.last_log_id({}) >= my_last_log_id({})",
+                req.last_log_id.summary(),
+                self.state.last_log_id().summary(),
+            );
+            return VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), false);
+        }
+
+        // Compared exactly as a real vote is accepted, but nothing is persisted or changed.
+        let granted = &req.vote >= self.state.vote_ref();
+        VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), granted)
+    }
+
+    /// Handle a reply to the Pre-Vote round `round`.
+    ///
+    /// Count a granted Pre-Vote for its round; once a quorum would grant one round, start the real
+    /// election. A rejection marks its round rejected, so that a new round may start before its
+    /// remaining replies are due; one that reports a greater log also delays the next campaign, and
+    /// one that reports a strictly higher vote catches this node up to that vote in non-committed
+    /// form, as a rejected real vote does.
+    ///
+    /// A voter that cannot answer Pre-Vote ends every round, and this node runs the classic
+    /// election for this campaign at once: Pre-Vote is used only while every voter that can be
+    /// reached answers it. A reply to a round that is no longer open is ignored.
+    #[tracing::instrument(level = "debug", skip(self, reply))]
+    pub(crate) fn handle_pre_vote_resp(&mut self, target: C::NodeId, round: u64, reply: PreVoteReply<C::NodeId>) {
+        tracing::info!(
+            reply = display(&reply),
+            target = display(&target),
+            round,
+            my_vote = display(self.state.vote_ref()),
+            my_last_log_id = display(self.state.last_log_id().summary()),
+            "{}",
+            func_name!()
+        );
+
+        if !self.pre_vote_rounds.is_open(round) {
+            tracing::info!(
+                latest_round = self.pre_vote_rounds.latest_id(),
+                "ignore a reply to a Pre-Vote round that is no longer open"
+            );
+            return;
+        }
+
+        let resp = match reply {
+            PreVoteReply::Answered(resp) => resp,
+            PreVoteReply::Unsupported => {
+                if !self.state.membership_state.effective().is_voter(&target) {
+                    tracing::warn!("ignore a Pre-Vote reply from a node that does not vote");
+                    return;
+                }
+                // The voter can still grant a vote, but it can never grant a Pre-Vote: without it
+                // a Pre-Vote quorum may never form. Campaign as a node without Pre-Vote does.
+                self.pre_vote_rounds.clear();
+                if self.leader.is_some() || !self.state.membership_state.effective().is_voter(&self.config.id) {
+                    tracing::info!("a voter cannot answer Pre-Vote, but this node leads or no longer votes");
+                    return;
+                }
+                tracing::info!("a voter cannot answer Pre-Vote; start the classic election");
+                self.elect();
+                return;
+            }
+        };
+
+        // The responder does not adopt the Pre-Vote, so a grant is read from `vote_granted`.
+        if resp.vote_granted {
+            let quorum_granted =
+                self.pre_vote_rounds.get_mut(round).is_some_and(|pre_round| pre_round.candidate.grant_by(&target));
+            if quorum_granted {
+                self.pre_vote_rounds.clear();
+                if self.leader.is_some() || !self.state.membership_state.effective().is_voter(&self.config.id) {
+                    tracing::info!("a quorum would grant the vote, but this node leads or no longer votes");
+                    return;
+                }
+                tracing::info!(round, "a quorum would grant the vote; start a real election");
+                self.elect();
+            }
+            return;
+        }
+
+        if let Some(pre_round) = self.pre_vote_rounds.get_mut(round) {
+            pre_round.rejected = true;
+        }
+
+        if resp.last_log_id.as_ref() > self.state.last_log_id() {
+            tracing::info!(
+                greater_log_id = display(resp.last_log_id.summary()),
+                "seen a greater log id when {}",
+                func_name!()
+            );
+            self.set_greater_log();
+        }
+
+        // Catch up to a strictly higher vote, never as committed. An equal vote is left alone: it
+        // would end the open rounds without new information. A vote for this node is not adopted
+        // either: no voter holds one for a term this node did not campaign in, so it can only be a
+        // faulty answer, and adopting it would vote for this node unsent.
+        if &resp.vote > self.state.vote_ref() && resp.vote.leader_id().voted_for() != Some(self.config.id.clone()) {
+            let mut vote = resp.vote.clone();
+            vote.committed = false;
+            let _ = self.vote_handler().update_vote(&vote);
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(self, resp))]
@@ -667,6 +946,9 @@ where C: RaftTypeConfig
     fn establish_leader(&mut self) {
         tracing::info!("{}", func_name!());
 
+        // An open Pre-Vote round must not start another campaign once this node leads.
+        self.pre_vote_rounds.clear();
+
         let candidate = self.candidate.take().unwrap();
         let leader = self.establish_handler().establish(candidate);
 
@@ -726,6 +1008,12 @@ where C: RaftTypeConfig
         }
     }
 
+    /// Whether this node campaigns: it holds an uncommitted vote for itself.
+    fn is_campaigning(&self) -> bool {
+        let vote = self.state.vote_ref();
+        !vote.is_committed() && vote.leader_id().voted_for().as_ref() == Some(&self.config.id)
+    }
+
     pub(crate) fn is_there_greater_log(&self) -> bool {
         self.seen_greater_log
     }
@@ -757,6 +1045,7 @@ where C: RaftTypeConfig
             output: &mut self.output,
             leader: &mut self.leader,
             candidate: &mut self.candidate,
+            pre_vote_rounds: &mut self.pre_vote_rounds,
         }
     }
 

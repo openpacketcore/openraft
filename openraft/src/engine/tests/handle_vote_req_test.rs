@@ -9,6 +9,7 @@ use crate::engine::testing::UTConfig;
 use crate::engine::Command;
 use crate::engine::Engine;
 use crate::engine::LogIdList;
+use crate::progress::Progress;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::testing::log_id;
@@ -57,6 +58,74 @@ fn test_handle_vote_req_rejected_by_leader_lease() -> anyhow::Result<()> {
 
     assert_eq!(ServerState::Candidate, eng.state.server_state);
     assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+/// A leader of `{0,1}` whose own vote is no longer leased, and which node 0 acknowledged just now.
+fn acknowledged_leader() -> Engine<UTConfig> {
+    let mut eng = eng();
+    eng.candidate = None;
+    eng.state.vote = UTime::new(TokioInstant::now() - Duration::from_secs(1), Vote::new_committed(2, 1));
+    eng.testing_new_leader().clock_progress.increase_to(&0, Some(TokioInstant::now())).unwrap();
+    eng.state.server_state = ServerState::Leader;
+    eng.output.take_commands();
+    eng
+}
+
+#[test]
+fn test_handle_vote_req_rejected_by_quorum_acknowledged_lease() -> anyhow::Result<()> {
+    let mut eng = acknowledged_leader();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(3, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert_eq!(VoteResponse::new(Vote::new_committed(2, 1), None, false), resp);
+    assert_eq!(Vote::new_committed(2, 1), *eng.state.vote_ref());
+    assert!(eng.leader.is_some(), "the leader keeps leading");
+    assert_eq!(0, eng.output.take_commands().len());
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_vote_req_planned_transfer_overrides_quorum_acknowledged_lease() -> anyhow::Result<()> {
+    let mut eng = acknowledged_leader();
+    // A planned handoff releases the lease of the retiring vote.
+    eng.state.vote.disable_lease();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(3, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert_eq!(VoteResponse::new(Vote::new(3, 0), None, true), resp);
+    assert_eq!(Vote::new(3, 0), *eng.state.vote_ref());
+    assert!(eng.leader.is_none(), "granting the successor ends this leadership");
+
+    Ok(())
+}
+
+#[test]
+fn test_handle_vote_req_granted_once_the_quorum_acknowledged_lease_expires() -> anyhow::Result<()> {
+    let mut eng = acknowledged_leader();
+    let expired = TokioInstant::now() - eng.config.timer_config.leader_lease - Duration::from_millis(1);
+    eng.leader.as_mut().unwrap().clock_progress = crate::progress::VecProgress::new(
+        eng.state.membership_state.effective().membership().to_quorum_set(),
+        [],
+        None,
+    );
+    eng.leader.as_mut().unwrap().clock_progress.increase_to(&0, Some(expired)).unwrap();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(3, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert_eq!(VoteResponse::new(Vote::new(3, 0), None, true), resp);
+    assert!(eng.leader.is_none());
 
     Ok(())
 }
@@ -211,5 +280,50 @@ fn test_handle_vote_req_granted_follower_learner_does_not_emit_update_server_sta
             eng.output.take_commands()
         );
     }
+    Ok(())
+}
+
+/// A candidate refused only because this campaigning node voted for itself, whose log is more up
+/// to date, makes this node defer its next campaign: by the greater-log timeout, from now.
+#[test]
+fn test_handle_vote_req_refused_fresher_candidate_defers_the_next_campaign() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.log_ids = LogIdList::new(vec![log_id(2, 1, 3)]);
+    let utime_before = eng.state.vote_last_modified().unwrap();
+    assert!(!eng.is_there_greater_log());
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(2, 0),
+        last_log_id: Some(log_id(2, 1, 4)),
+    });
+
+    assert!(!resp.vote_granted, "this node already voted for itself in term 2");
+    assert_eq!(Vote::new(2, 1), *eng.state.vote_ref());
+    assert!(eng.is_there_greater_log(), "the greater-log timeout applies");
+    assert!(
+        eng.state.vote_last_modified().unwrap() > utime_before,
+        "the election timer restarts from now"
+    );
+    assert_eq!(0, eng.output.take_commands().len(), "nothing is persisted");
+
+    Ok(())
+}
+
+/// A candidate refused for its vote whose log is not more up to date changes nothing.
+#[test]
+fn test_handle_vote_req_refused_candidate_without_a_greater_log_defers_nothing() -> anyhow::Result<()> {
+    let mut eng = eng();
+    eng.state.log_ids = LogIdList::new(vec![log_id(2, 1, 3)]);
+    let utime_before = eng.state.vote_last_modified();
+
+    let resp = eng.handle_vote_req(VoteRequest {
+        vote: Vote::new(2, 0),
+        last_log_id: Some(log_id(2, 1, 3)),
+    });
+
+    assert!(!resp.vote_granted);
+    assert!(!eng.is_there_greater_log());
+    assert_eq!(utime_before, eng.state.vote_last_modified());
+
     Ok(())
 }

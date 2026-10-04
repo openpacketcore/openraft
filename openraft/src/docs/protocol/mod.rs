@@ -1,5 +1,9 @@
 //! The protocol used by Openraft to replicate data.
 
+pub mod pre_vote {
+    #![doc = include_str!("pre_vote.md")]
+}
+
 pub mod read {
     #![doc = include_str!("read.md")]
 }

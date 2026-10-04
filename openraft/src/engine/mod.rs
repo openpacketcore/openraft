@@ -34,6 +34,7 @@ mod engine_impl;
 mod engine_output;
 mod leadership_transfer;
 mod log_id_list;
+pub(crate) mod pre_vote_rounds;
 
 pub(crate) mod handler;
 pub(crate) mod time_state;
@@ -48,6 +49,7 @@ mod tests {
     mod install_full_snapshot_test;
     mod leadership_transfer_test;
     mod log_id_list_test;
+    mod pre_vote_test;
     mod startup_test;
     mod trigger_purge_log_test;
 }
