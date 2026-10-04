@@ -84,8 +84,9 @@ async fn pre_vote_round_rejected_by_a_running_lease_is_retried_within_the_bound(
     let lost = Instant::now();
     router.set_network_error(0, true);
     router.set_rpc_failure(1, Direction::NetRecv, None);
-    router.set_append_entries_quota(None);
 
+    // Keep the quota at zero through the election and timing assertions. An AppendEntries RPC
+    // admitted before isolating node 0 can still be waiting on the router's send delay.
     n1.wait(Some(bound * 4))
         .state(ServerState::Leader, "node 1, with the most up-to-date log, is elected")
         .await?;
@@ -101,6 +102,7 @@ async fn pre_vote_round_rejected_by_a_running_lease_is_retried_within_the_bound(
         n0.metrics().borrow().current_term + 1,
         n1.metrics().borrow().current_term
     );
+    router.set_append_entries_quota(None);
 
     Ok(())
 }
