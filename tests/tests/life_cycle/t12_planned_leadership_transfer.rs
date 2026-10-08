@@ -194,3 +194,68 @@ async fn retired_follower_refuses_handoff_without_changing_its_vote() -> anyhow:
     assert!(old.ensure_linearizable().await.is_err());
     stop_all(&mut router).await
 }
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn admission_changes_during_handoff_preserve_pending_writes_and_catch_up_the_target() -> anyhow::Result<()> {
+    for shutdown in [false, true] {
+        for reopen in [false, true] {
+            let mut cfg = (*config()).clone();
+            // No timer-driven election can mask missing replication streams.
+            // Only delivery of the handoff request may elect the successor.
+            cfg.enable_tick = false;
+            cfg.enable_elect = false;
+            let mut router = RaftRouter::new(Arc::new(cfg));
+            let log_index = router.new_cluster(btreeset! {0, 1, 2}, btreeset! {}).await?;
+            let old = router.get_raft_handle(&0)?;
+            let next = router.get_raft_handle(&1)?;
+            let other = router.get_raft_handle(&2)?;
+            let receipt = if reopen {
+                Some(old.fence_peer_responses(2).await?)
+            } else {
+                None
+            };
+            router.set_network_error(0, true);
+
+            let result = tokio::time::timeout(HANDOFF_BUDGET, async {
+                let pending = old.client_write_ff(ClientRequest::make_request("pending-fence", 1)).await?;
+                old.wait(Some(HANDOFF_BUDGET))
+                    .log_index(Some(log_index + 1), "accepted before admission stopped")
+                    .await?;
+                let request = if shutdown {
+                    old.prepare_shutdown(Some(1)).await?.unwrap()
+                } else {
+                    old.begin_leadership_transfer(1).await?
+                };
+                assert_eq!(Some(log_index + 1), request.last_log_id().map(|id| id.index));
+                let error = next.handle_leadership_transfer(request.clone()).await.unwrap_err();
+                assert_eq!(Some(TransferLeaderError::LogNotApplied), error.into_api_error());
+
+                if let Some(receipt) = receipt {
+                    assert!(old.release_peer_response_fence(receipt).await?);
+                } else {
+                    old.fence_peer_responses(2).await?;
+                }
+                router.set_network_error(0, false);
+                let reply = pending.await??;
+                assert_eq!(log_index + 1, reply.log_id.index, "the original write settles once");
+                next.wait(Some(HANDOFF_BUDGET))
+                    .applied_index(Some(reply.log_id.index), "admitted transfer target caught up")
+                    .await?;
+                let old_term = request.from().leader_id().term;
+                other.handle_leadership_transfer(request.clone()).await?;
+                next.handle_leadership_transfer(request).await?;
+                next.wait(Some(HANDOFF_BUDGET)).state(ServerState::Leader, "handoff elected successor").await?;
+                assert!(next.metrics().borrow().current_term > old_term);
+                next.ensure_linearizable().await?;
+                let reply = next.client_write(ClientRequest::make_request("pending-fence", 2)).await?;
+                assert_eq!(Some("request-1"), reply.data.0.as_deref());
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+            router.set_network_error(0, false);
+            stop_all(&mut router).await?;
+            result??;
+        }
+    }
+    Ok(())
+}

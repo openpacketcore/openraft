@@ -50,6 +50,14 @@ other candidates until the application actually shuts them down. They cannot be
 selected as handoff targets. Reopening a voter constructs a new Raft instance
 under the application's existing storage and ownership rules.
 
+A leader also refuses a supplied successor whose responses it has fenced, even
+on a repeated handoff call; this refusal does not undo an earlier retirement.
+A fence or release during a handoff rebuilds streams to admitted peers so the
+accepted prefix can still reach the successor. It sends log data without forcing
+empty heartbeats while leader admission is stopped. Each admission change
+restarts every replication stream, including snapshots to healthy peers; an old
+snapshot task may finish alongside its replacement and delay log purging.
+
 [`Raft::begin_leadership_transfer`][begin] is a narrower leader-only operation.
 It stops admission for the current leader vote but does not permanently retire
 the node. Use `prepare_shutdown` for planned retirement rather than checking role

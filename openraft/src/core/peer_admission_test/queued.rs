@@ -610,3 +610,107 @@ async fn reads_still_require_the_original_majority_when_remote_peers_are_fenced(
         vec![1, 2, 3]
     );
 }
+
+#[tokio::test]
+async fn admission_changes_rebuild_streams_during_transfer_and_shutdown_without_heartbeats() {
+    use futures::StreamExt;
+
+    use crate::engine::Command;
+
+    let mut observed = Vec::new();
+    for mode in ["normal", "transfer", "shutdown"] {
+        for reopen in [false, true] {
+            let mut core = core(&[1, 2, 3], true);
+            core.log_store.0.lock().unwrap().log.extend((0..=10).map(|index| {
+                (index, Entry {
+                    log_id: log(index),
+                    payload: EntryPayload::Blank,
+                })
+            }));
+            // The admitted successor is already caught up: only ordinary
+            // leadership may send it an empty heartbeat when streams restart.
+            *core.engine.leader.as_mut().unwrap().progress.get_mut(&2).unwrap() = ProgressEntry::new(Some(log(10)));
+            core.engine.replication_handler().rebuild_replication_streams();
+            core.run_engine_commands().await.unwrap();
+            let receipt = if reopen { Some(fence(&mut core, 3).await) } else { None };
+            if reopen {
+                core.run_engine_commands().await.unwrap();
+            }
+            match mode {
+                "transfer" => {
+                    core.engine.begin_leadership_transfer(2).unwrap();
+                }
+                "shutdown" => {
+                    core.engine.prepare_shutdown(Some(2)).unwrap();
+                }
+                _ => {}
+            }
+            core.engine.output.take_commands();
+            let vote = core.engine.state.vote.clone();
+            if let Some(receipt) = receipt {
+                release(&mut core, receipt).await;
+            } else {
+                fence(&mut core, 3).await;
+            }
+            let heartbeat = core.engine.output.commands.iter().any(|command| {
+                matches!(command, Command::Replicate {
+                    target: 2,
+                    req: Inflight::None
+                })
+            });
+            core.run_engine_commands().await.unwrap();
+            let streams = core.replications.keys().copied().collect::<Vec<_>>();
+            assert_eq!(core.engine.state.vote, vote, "admission cannot re-arm the lease");
+            observed.push((mode, reopen, heartbeat, streams));
+            core.remove_all_replication();
+            while let Some(joined) = core.retired_replications.next().await {
+                joined.unwrap().unwrap();
+            }
+        }
+    }
+    for (mode, reopen, heartbeat, streams) in &observed {
+        let expected = if *reopen { vec![2, 3] } else { vec![2] };
+        assert_eq!(*streams, expected, "admitted peers must retain streams: {observed:?}");
+        assert_eq!(
+            *heartbeat,
+            *mode == "normal",
+            "handoff must not renew leases: {observed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fenced_handoff_target_is_refused_before_stopping_leader_admission() {
+    use crate::raft::TransferLeaderError;
+
+    for shutdown in [false, true] {
+        let mut core = core(&[1, 2, 3], true);
+        fence(&mut core, 3).await;
+        let vote = core.engine.state.vote.clone();
+        if shutdown {
+            let (tx, rx) = TestConfig::oneshot();
+            core.handle_api_msg(RaftMsg::PrepareShutdown { to: Some(3), tx }).await;
+            assert_eq!(rx.await.unwrap(), Err(TransferLeaderError::InvalidTarget));
+        } else {
+            let (tx, rx) = TestConfig::oneshot();
+            core.handle_api_msg(RaftMsg::BeginLeadershipTransfer { to: 3, tx }).await;
+            assert_eq!(rx.await.unwrap(), Err(TransferLeaderError::InvalidTarget));
+        }
+        assert_eq!(core.engine.state.vote, vote);
+        assert!(core.engine.prepared_shutdown.is_none());
+        assert!(core.engine.leader.as_ref().unwrap().transfer_to.is_none());
+        assert!(
+            core.engine.leader_handler().is_ok(),
+            "the refused target must not stop admission"
+        );
+    }
+
+    // A nonleader needs no successor to retire, even if its caller supplies
+    // a target that is currently fenced on this node.
+    let mut core = core(&[1, 2, 3], false);
+    fence(&mut core, 3).await;
+    let (tx, rx) = TestConfig::oneshot();
+    core.handle_api_msg(RaftMsg::PrepareShutdown { to: Some(3), tx }).await;
+    assert_eq!(rx.await.unwrap(), Ok(None));
+    assert!(core.engine.prepared_shutdown.is_some());
+}

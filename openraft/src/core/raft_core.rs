@@ -76,6 +76,7 @@ use crate::raft::responder::Responder;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::ClientWriteResponse;
+use crate::raft::TransferLeaderError;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
 use crate::raft_state::LogIOId;
@@ -1304,10 +1305,17 @@ where
             )
         });
         self.remove_all_replication();
-        if let Ok(mut leader) = self.engine.leader_handler() {
-            let mut replication = leader.replication_handler();
+        if let Some(leader) = self.engine.leader.as_ref() {
+            // A handoff stops new leader operations, but its accepted prefix
+            // must still reach the successor. Do not renew follower leases.
+            let send_none = if leader.transfer_to.is_some() || self.engine.prepared_shutdown.is_some() {
+                SendNone::False
+            } else {
+                SendNone::True
+            };
+            let mut replication = self.engine.replication_handler();
             replication.rebuild_replication_streams();
-            replication.initiate_replication(SendNone::True);
+            replication.initiate_replication(send_none);
         }
     }
 
@@ -1379,11 +1387,21 @@ where
                 self.change_membership(changes, retain, tx);
             }
             RaftMsg::BeginLeadershipTransfer { to, tx } => {
-                let result = self.engine.begin_leadership_transfer(to);
+                let result = if self.engine.leader.is_some() && !self.peer_admission.allows(&to) {
+                    Err(TransferLeaderError::InvalidTarget)
+                } else {
+                    self.engine.begin_leadership_transfer(to)
+                };
                 let _ = tx.send(result);
             }
             RaftMsg::PrepareShutdown { to, tx } => {
-                let result = self.engine.prepare_shutdown(to);
+                let result = if self.engine.leader.is_some()
+                    && to.as_ref().is_some_and(|target| !self.peer_admission.allows(target))
+                {
+                    Err(TransferLeaderError::InvalidTarget)
+                } else {
+                    self.engine.prepare_shutdown(to)
+                };
                 let _ = tx.send(result);
             }
             RaftMsg::HandleLeadershipTransfer { request, tx } => {

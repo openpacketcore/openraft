@@ -54,7 +54,7 @@ pub enum TransferLeaderError {
     /// Delivery to the issuing leader cannot release a lease before admission stops.
     #[error("leadership transfer has not stopped leader admission")]
     NotPrepared,
-    /// The target is this leader, absent, or not a voter.
+    /// The target is this leader, absent, not a voter, or fenced by this leader.
     #[error("leadership transfer target is not an eligible voter")]
     InvalidTarget,
     /// A different handoff has already stopped admission in this term.

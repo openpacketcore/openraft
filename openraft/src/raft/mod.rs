@@ -434,7 +434,9 @@ where C: RaftTypeConfig
     /// fresh successor leadership is observed. The handoff does not change
     /// membership and is supported only for a committed stable configuration.
     ///
-    /// Repeating this call for the same target in the same vote is idempotent.
+    /// Repeating this call for the same target in the same vote is idempotent,
+    /// unless that target's responses have since been fenced: a current leader
+    /// refuses a fenced target with [`TransferLeaderError::InvalidTarget`].
     /// Cancellation after dispatch may already have stopped admission. Once
     /// initiated, admission cannot be resumed in the retiring vote; normal
     /// elections and new votes remain authoritative. Callers that cache a
@@ -475,6 +477,12 @@ where C: RaftTypeConfig
     /// receipt. Admission changes conservatively invalidate all in-flight remote
     /// response generations, restart replication to admitted peers, and fail old
     /// read rounds with `QuorumNotEnough`; callers may retry those reads.
+    /// Every fence or successful release restarts **all** replication streams,
+    /// including snapshot transfers to healthy peers. Retired snapshot tasks
+    /// still finish before their log-retention guards are released, so a large
+    /// snapshot may be sent twice and log purging may wait for the old task.
+    /// A candidate whose pending votes were invalidated may wait until its next
+    /// election timeout to request fresh votes.
     pub async fn fence_peer_responses(
         &self,
         peer: C::NodeId,
@@ -491,6 +499,8 @@ where C: RaftTypeConfig
     /// Other peers' fences and receipts remain in force. Cancellation after
     /// dispatch may already have released the fence; repeating the same release
     /// is harmless. This does not establish that a peer is safe to readmit.
+    /// A successful release has the same cost of restarting replication and
+    /// snapshots described by [`Self::fence_peer_responses`].
     pub async fn release_peer_response_fence(
         &self,
         fence: PeerResponseFence<C::NodeId>,
@@ -509,7 +519,9 @@ where C: RaftTypeConfig
     /// snapshot installation and votes for other candidates remain available.
     ///
     /// Retirement cannot be reversed without creating a new Raft instance.
-    /// Repeated calls retain the original result, even after a vote change;
+    /// A current leader refuses a supplied target whose responses are fenced,
+    /// with [`TransferLeaderError::InvalidTarget`], including on repeated calls.
+    /// Otherwise repeated calls retain the original result, even after a vote change;
     /// selecting a different target for an existing handoff is refused. This
     /// operation does not stop the engine or certify successor leadership.
     /// Authenticate and deliver a returned request, observe the successor's
