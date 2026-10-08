@@ -42,6 +42,7 @@ use crate::display_ext::DisplayInstantExt;
 use crate::display_ext::DisplayOption;
 use crate::display_ext::DisplayOptionExt;
 use crate::display_ext::DisplaySlice;
+use crate::engine::handler::replication_handler::SendNone;
 use crate::engine::Command;
 use crate::engine::Condition;
 use crate::engine::Engine;
@@ -66,6 +67,7 @@ use crate::network::RPCOption;
 use crate::network::RPCTypes;
 use crate::network::RaftNetwork;
 use crate::network::RaftNetworkFactory;
+use crate::peer_admission::PeerAdmission;
 use crate::progress::entry::ProgressEntry;
 use crate::progress::Inflight;
 use crate::progress::Progress;
@@ -104,6 +106,7 @@ use crate::MessageSummary;
 use crate::Node;
 use crate::NodeId;
 use crate::OptionalSend;
+use crate::PeerResponseFenceError;
 use crate::RaftTypeConfig;
 use crate::StorageError;
 use crate::StorageIOError;
@@ -196,6 +199,8 @@ where
     pub(crate) retired_replications: FuturesUnordered<JoinHandleOf<C, Result<(), Fatal<C::NodeId>>>>,
 
     pub(crate) leader_data: Option<LeaderData<C>>,
+
+    pub(crate) peer_admission: PeerAdmission<C::NodeId>,
 
     #[allow(dead_code)]
     pub(crate) tx_api: mpsc::UnboundedSender<RaftMsg<C>>,
@@ -340,6 +345,7 @@ where
         let ttl = Duration::from_millis(self.config.heartbeat_interval);
         let eff_mem = self.engine.state.membership_state.effective().clone();
         let core_tx = self.tx_notify.clone();
+        let generation = self.peer_admission.generation.clone();
 
         let mut granted = btreeset! {my_id.clone()};
 
@@ -359,7 +365,7 @@ where
         for (target, progress) in voter_progresses {
             let target = target.clone();
 
-            if target == my_id {
+            if target == my_id || !self.peer_admission.allows(&target) {
                 continue;
             }
 
@@ -432,6 +438,7 @@ where
                     );
 
                     let send_res = core_tx.send(Notify::HigherVote {
+                        generation: generation.clone(),
                         target,
                         higher: vote,
                         sender_vote: my_vote,
@@ -443,14 +450,22 @@ where
 
                     // we are no longer leader so error out early
                     let err = ForwardToLeader::empty();
-                    let _ = tx.send(Err(err.into()));
+                    let _ = core_tx.send(Notify::ReadResult {
+                        generation,
+                        result: Err(err.into()),
+                        tx,
+                    });
                     return;
                 }
 
                 granted.insert(target);
 
                 if eff_mem.is_quorum(granted.iter()) {
-                    let _ = tx.send(Ok(resp));
+                    let _ = core_tx.send(Notify::ReadResult {
+                        generation,
+                        result: Ok(resp),
+                        tx,
+                    });
                     return;
                 }
             }
@@ -458,11 +473,12 @@ where
             // If we've hit this location, then we've failed to gather needed confirmations due to
             // request failures.
 
-            let _ = tx.send(Err(QuorumNotEnough {
+            let result = Err(QuorumNotEnough {
                 cluster: eff_mem.membership().summary(),
                 got: granted,
             }
-            .into()));
+            .into());
+            let _ = core_tx.send(Notify::ReadResult { generation, result, tx });
         };
 
         // TODO: do not spawn, manage read requests with a queue by RaftCore
@@ -891,6 +907,7 @@ where
         ReplicationCore::<C, N, LS>::spawn(
             target.clone(),
             session_id,
+            self.peer_admission.generation.clone(),
             self.config.clone(),
             self.engine.state.committed().cloned(),
             progress_entry.matching,
@@ -1180,7 +1197,7 @@ where
         let vote = vote_req.vote.clone();
 
         for target in members {
-            if target == self.id {
+            if target == self.id || !self.peer_admission.allows(&target) {
                 continue;
             }
 
@@ -1191,6 +1208,7 @@ where
             let mut client = self.network.new_client(target.clone(), &target_node).await;
 
             let tx = self.tx_notify.clone();
+            let generation = self.peer_admission.generation.clone();
 
             let ttl = Duration::from_millis(self.config.election_timeout_min);
             let id = self.id.clone();
@@ -1223,6 +1241,7 @@ where
                         match res {
                             Ok(resp) => {
                                 let _ = tx.send(Notify::VoteResponse {
+                                    generation,
                                     target,
                                     resp,
                                     sender_vote: vote,
@@ -1263,12 +1282,57 @@ where
         }
     }
 
+    /// Start a fresh response generation without changing any quorum or commit.
+    fn reset_peer_response_evidence(&mut self, peer: &C::NodeId) {
+        if let Some(candidate) = &mut self.engine.candidate {
+            candidate.revoke_grant(peer);
+        }
+        if let Some(leader) = &mut self.engine.leader {
+            let minimum = ProgressEntry::empty(leader.last_log_id().next_index());
+            leader.progress.reset(peer, minimum);
+            leader.clock_progress.reset(peer, None);
+        }
+
+        // Pending transport commands describe the previous generation. Keep all
+        // persistence/commit/response commands; recreate only replication work.
+        self.engine.output.commands.retain(|cmd| {
+            !matches!(
+                cmd,
+                Command::Replicate { .. }
+                    | Command::RebuildReplicationStreams { .. }
+                    | Command::ReplicateCommitted { .. }
+            )
+        });
+        self.remove_all_replication();
+        if let Ok(mut leader) = self.engine.leader_handler() {
+            let mut replication = leader.replication_handler();
+            replication.rebuild_replication_streams();
+            replication.initiate_replication(SendNone::True);
+        }
+    }
+
     // TODO: Make this method non-async. It does not need to run any async command in it.
     #[tracing::instrument(level = "debug", skip(self, msg), fields(state = debug(self.engine.state.server_state), id=display(&self.id)))]
     pub(crate) async fn handle_api_msg(&mut self, msg: RaftMsg<C>) {
         tracing::debug!("recv from rx_api: {}", msg.summary());
 
         match msg {
+            RaftMsg::FencePeerResponses { peer, tx } => {
+                if peer == self.id {
+                    let _ = tx.send(Err(PeerResponseFenceError::LocalNode));
+                } else {
+                    let fence = self.peer_admission.fence(peer.clone());
+                    self.reset_peer_response_evidence(&peer);
+                    let _ = tx.send(Ok(fence));
+                }
+            }
+            RaftMsg::ReleasePeerResponseFence { fence, tx } => {
+                let released = self.peer_admission.release(&fence);
+                if released {
+                    self.reset_peer_response_evidence(&fence.peer);
+                }
+                let _ = tx.send(Ok(released));
+            }
             RaftMsg::AppendEntries { rpc, tx } => {
                 self.handle_append_entries_request(rpc, tx);
             }
@@ -1372,6 +1436,7 @@ where
 
         match notify {
             Notify::VoteResponse {
+                generation,
                 target,
                 resp,
                 sender_vote,
@@ -1385,12 +1450,15 @@ where
                     func_name!()
                 );
 
-                if self.does_vote_match(&sender_vote, "VoteResponse") {
+                if (target == self.id || self.peer_admission.accepts(&target, &generation))
+                    && self.does_vote_match(&sender_vote, "VoteResponse")
+                {
                     self.engine.handle_vote_resp(target, resp);
                 }
             }
 
             Notify::HigherVote {
+                generation,
                 target,
                 higher,
                 sender_vote,
@@ -1403,7 +1471,8 @@ where
                     func_name!()
                 );
 
-                if self.does_vote_match(&sender_vote, "HigherVote") {
+                if self.peer_admission.accepts(&target, &generation) && self.does_vote_match(&sender_vote, "HigherVote")
+                {
                     // Rejected vote change is ok.
                     let _ = self.engine.vote_handler().update_vote(&higher);
                 }
@@ -1459,7 +1528,19 @@ where
                 }
             }
 
-            Notify::Network { response } => {
+            Notify::ReadResult { generation, result, tx } => {
+                let result = if self.peer_admission.generation.same_as(&generation) {
+                    result
+                } else {
+                    Err(QuorumNotEnough {
+                        cluster: self.engine.state.membership_state.effective().membership().summary(),
+                        got: Default::default(),
+                    }
+                    .into())
+                };
+                let _ = tx.send(result);
+            }
+            Notify::Network { generation, response } => {
                 //
                 match response {
                     replication::Response::Progress {
@@ -1470,7 +1551,9 @@ where
                     } => {
                         // If vote or membership changes, ignore the message.
                         // There is chance delayed message reports a wrong state.
-                        if self.does_replication_session_match(&session_id, "UpdateReplicationMatched") {
+                        if self.peer_admission.accepts(&target, &generation)
+                            && self.does_replication_session_match(&session_id, "UpdateReplicationMatched")
+                        {
                             self.handle_replication_progress(target, id, result);
                         }
                     }
@@ -1498,7 +1581,9 @@ where
                             func_name!()
                         );
 
-                        if self.does_vote_match(&sender_vote, "HigherVote") {
+                        if self.peer_admission.accepts(&target, &generation)
+                            && self.does_vote_match(&sender_vote, "HigherVote")
+                        {
                             // Rejected vote change is ok.
                             let _ = self.engine.vote_handler().update_vote(&higher);
                         }
@@ -1833,6 +1918,7 @@ where
                 self.engine.state.io_state_mut().update_vote(vote.clone());
 
                 let _ = self.tx_notify.send(Notify::VoteResponse {
+                    generation: self.peer_admission.generation.clone(),
                     target: self.id.clone(),
                     // last_log_id is not used when sending VoteRequest to local node
                     resp: VoteResponse::new(vote.clone(), None, true),
@@ -1898,6 +1984,15 @@ where
                 }
             }
             Command::Replicate { req, target } => {
+                if !self.peer_admission.allows(&target) {
+                    // No transport owns this range: do not retain it for purge.
+                    if let Some(leader) = &mut self.engine.leader {
+                        if let Some(progress) = leader.progress.get_mut(&target) {
+                            progress.inflight = Inflight::None;
+                        }
+                    }
+                    return Ok(None);
+                }
                 let node = self.replications.get(&target).expect("replication to target node exists");
 
                 match req {
@@ -1924,6 +2019,9 @@ where
                 self.remove_all_replication();
 
                 for (target, matching) in targets.iter() {
+                    if !self.peer_admission.allows(target) {
+                        continue;
+                    }
                     let handle = self.spawn_replication_stream(target.clone(), matching.clone()).await;
                     self.replications.insert(target.clone(), handle);
                 }

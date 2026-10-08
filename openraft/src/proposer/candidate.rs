@@ -86,6 +86,11 @@ where
         &self.progress
     }
 
+    /// Forget a remote grant while keeping the original election quorum.
+    pub(crate) fn revoke_grant(&mut self, target: &C::NodeId) {
+        self.progress.reset(target, false);
+    }
+
     /// Grant the vote by a node.
     pub(crate) fn grant_by(&mut self, target: &C::NodeId) -> bool {
         let granted = *self.progress.update(target, true).expect("target not in quorum set");

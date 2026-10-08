@@ -347,6 +347,7 @@ impl Run {
         let (tx_raft_core, rx) = mpsc::unbounded_channel();
         let core = Core {
             target: 2,
+            generation: Default::default(),
             session_id: ReplicationSessionId::new(vote(), Some(log_id(0))),
             tx_raft_core,
             rx_event,
@@ -434,6 +435,7 @@ impl Run {
     fn progress(&mut self, expected_id: RequestId, matching: Option<LogId<u64>>) -> Instant {
         match self.rx.try_recv().expect("production replication notification") {
             Notify::Network {
+                generation: _,
                 response:
                     Response::Progress {
                         target,
@@ -457,6 +459,7 @@ impl Run {
     fn error(&mut self, expected_id: RequestId, fragment: &str) {
         match self.rx.try_recv().expect("production error notification") {
             Notify::Network {
+                generation: _,
                 response: Response::Progress { request_id, result, .. },
             } => {
                 assert_eq!(request_id, expected_id);
@@ -676,6 +679,7 @@ async fn higher_vote_and_conflict_keep_their_original_classification() {
     assert_eq!(run.counts(), (1, 1, 1));
     match run.rx.try_recv().unwrap() {
         Notify::Network {
+            generation: _,
             response:
                 Response::HigherVote {
                     target,
@@ -696,6 +700,7 @@ async fn higher_vote_and_conflict_keep_their_original_classification() {
     run.pending();
     match run.rx.try_recv().unwrap() {
         Notify::Network {
+            generation: _,
             response: Response::Progress { request_id, result, .. },
         } => {
             assert_eq!(request_id, run.request_id);
@@ -796,6 +801,7 @@ async fn storage_error_is_fatal_without_a_retry_timer() {
     assert!(matches!(run.poll(), Poll::Ready(Err(Fatal::StorageError(_)))));
     assert_eq!(run.counts(), (1, 0, 0));
     assert!(matches!(run.rx.try_recv().unwrap(), Notify::Network {
+        generation: _,
         response: Response::StorageError { .. }
     }));
     assert_eq!(Instant::now(), start);

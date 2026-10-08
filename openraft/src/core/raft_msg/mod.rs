@@ -20,6 +20,8 @@ use crate::type_config::alias::ResponderOf;
 use crate::type_config::alias::SnapshotDataOf;
 use crate::ChangeMembers;
 use crate::MessageSummary;
+use crate::PeerResponseFence;
+use crate::PeerResponseFenceError;
 use crate::RaftTypeConfig;
 use crate::Snapshot;
 use crate::Vote;
@@ -35,9 +37,12 @@ pub(crate) type VoteTx<C> = ResultSender<C, VoteResponse<NodeIdOf<C>>>;
 /// TX for Append Entries Response
 pub(crate) type AppendEntriesTx<C> = ResultSender<C, AppendEntriesResponse<NodeIdOf<C>>>;
 
+/// Linearizable read result, published by the serialized core.
+pub(crate) type ClientReadResult<C> =
+    Result<(Option<LogIdOf<C>>, Option<LogIdOf<C>>), CheckIsLeaderError<NodeIdOf<C>, NodeOf<C>>>;
+
 /// TX for Linearizable Read Response
-pub(crate) type ClientReadTx<C> =
-    ResultSender<C, (Option<LogIdOf<C>>, Option<LogIdOf<C>>), CheckIsLeaderError<NodeIdOf<C>, NodeOf<C>>>;
+pub(crate) type ClientReadTx<C> = OneshotSenderOf<C, ClientReadResult<C>>;
 
 /// A message sent by application to the [`RaftCore`].
 ///
@@ -45,6 +50,16 @@ pub(crate) type ClientReadTx<C> =
 pub(crate) enum RaftMsg<C>
 where C: RaftTypeConfig
 {
+    FencePeerResponses {
+        peer: C::NodeId,
+        tx: ResultSender<C, PeerResponseFence<C::NodeId>, PeerResponseFenceError>,
+    },
+
+    ReleasePeerResponseFence {
+        fence: PeerResponseFence<C::NodeId>,
+        tx: ResultSender<C, bool>,
+    },
+
     AppendEntries {
         rpc: AppendEntriesRequest<C>,
         tx: AppendEntriesTx<C>,
@@ -124,6 +139,8 @@ where C: RaftTypeConfig
 {
     fn summary(&self) -> String {
         match self {
+            RaftMsg::FencePeerResponses { peer, .. } => format!("FencePeerResponses: {}", peer),
+            RaftMsg::ReleasePeerResponseFence { fence, .. } => format!("ReleasePeerResponseFence: {}", fence.peer),
             RaftMsg::AppendEntries { rpc, .. } => {
                 format!("AppendEntries: {}", rpc.summary())
             }

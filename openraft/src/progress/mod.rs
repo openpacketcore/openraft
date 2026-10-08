@@ -192,6 +192,23 @@ where
         }
     }
 
+    /// Forget one peer's accumulated evidence without changing the quorum set.
+    ///
+    /// Ordinary updates are monotonic. Admission revocation starts a new
+    /// calculation from the minimum value, retaining every other peer and the
+    /// exact original voter/learner roles, including joint configurations.
+    pub(crate) fn reset(&mut self, target: &ID, minimum: V)
+    where QS: Clone + 'static {
+        let learners = self.vector[self.voter_count..].iter().map(|(id, _)| id.clone());
+        let mut rebuilt = Self::new(self.quorum_set.clone(), learners, minimum);
+        for (id, value) in &self.vector {
+            if id != target {
+                let _ = rebuilt.update(id, value.clone());
+            }
+        }
+        *self = rebuilt;
+    }
+
     /// Find the index in of the specified id.
     #[inline(always)]
     pub(crate) fn index(&self, target: &ID) -> Option<usize> {
@@ -390,6 +407,26 @@ mod t {
     use super::Progress;
     use super::VecProgress;
     use crate::quorum::Joint;
+
+    #[test]
+    fn reset_recomputes_granted_without_changing_joint_quorums_or_learners() {
+        let qs = Joint::new(vec![vec![1, 2, 3], vec![3, 4, 5]]);
+        let mut progress = VecProgress::<u64, u64, u64, _>::new(qs.clone(), [6], 0);
+        for id in [1, 2, 3, 4, 6] {
+            let _ = progress.update(&id, 10);
+        }
+        assert_eq!(*progress.granted(), 10);
+        progress.reset(&3, 0);
+        assert_eq!(*progress.granted(), 0, "second original quorum still needs two voters");
+        assert_eq!(progress.quorum_set(), &qs);
+        assert_eq!(progress.is_voter(&6), Some(false));
+        assert_eq!(*progress.get(&6), 10);
+        assert_eq!(*progress.update(&5, 9).unwrap(), 9);
+        progress.reset(&42, 0);
+        assert_eq!(*progress.granted(), 9, "unknown peer does not alter progress");
+        progress.reset(&6, 0);
+        assert_eq!(*progress.granted(), 9, "learner cannot affect quorum");
+    }
 
     #[test]
     fn vec_progress_new() -> anyhow::Result<()> {

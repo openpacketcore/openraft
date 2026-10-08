@@ -90,6 +90,8 @@ use crate::LogId;
 use crate::LogIdOptionExt;
 use crate::MessageSummary;
 use crate::OptionalSend;
+use crate::PeerResponseFence;
+use crate::PeerResponseFenceError;
 use crate::RaftState;
 pub use crate::RaftTypeConfig;
 use crate::Snapshot;
@@ -289,6 +291,7 @@ where C: RaftTypeConfig
 
             replications: Default::default(),
             retired_replications: Default::default(),
+            peer_admission: Default::default(),
             leader_data: None,
 
             tx_api: tx_api.clone(),
@@ -443,6 +446,57 @@ where C: RaftTypeConfig
     ) -> Result<TransferLeaderRequest<C::NodeId>, RaftError<C::NodeId, TransferLeaderError>> {
         let (tx, rx) = C::AsyncRuntime::oneshot();
         self.inner.call_core(RaftMsg::BeginLeadershipTransfer { to, tx }, rx).await
+    }
+
+    /// Fence a remote peer's response authority in the serialized Raft core.
+    ///
+    /// On acknowledgement, responses from before this fence (including returned
+    /// RPCs and queued callbacks) can no longer update votes, terms, replication
+    /// or heartbeat progress, or publish a quorum-read result. Cached grants and
+    /// progress from this peer are forgotten. Already consumed effects, committed
+    /// decisions, and read proofs already published before the fence are not
+    /// retracted. The local node cannot be fenced.
+    ///
+    /// Membership and quorum denominators are unchanged: a fenced voter still
+    /// occupies its place in every original or joint quorum. This is an admission
+    /// primitive for applications with an authenticated retirement protocol, not
+    /// a failure detector or permission to remove a voter. Raft's majority and
+    /// current-term commit rules still apply; see the [Raft paper](https://raft.github.io/raft.pdf)
+    /// and the disruptive-server discussion in [Ongaro's thesis, section 4.2.3](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf).
+    ///
+    /// The fence is local and volatile. Applications must gate incoming RPCs
+    /// separately, durably record their admission policy, and reconstruct fences
+    /// before admitting network traffic on restart. Invalidate application-cached
+    /// read leases before calling. This call does not join outstanding network or
+    /// storage tasks; their local I/O failures remain fatal.
+    ///
+    /// Each successful call replaces this peer's previous receipt. Cancellation
+    /// after dispatch may already have installed a fence; retry to obtain a new
+    /// receipt. Admission changes conservatively invalidate all in-flight remote
+    /// response generations, restart replication to admitted peers, and fail old
+    /// read rounds with `QuorumNotEnough`; callers may retry those reads.
+    pub async fn fence_peer_responses(
+        &self,
+        peer: C::NodeId,
+    ) -> Result<PeerResponseFence<C::NodeId>, RaftError<C::NodeId, PeerResponseFenceError>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::FencePeerResponses { peer, tx }, rx).await
+    }
+
+    /// Release exactly the fence represented by this instance-local receipt.
+    ///
+    /// Returns `false` without effect for an obsolete, already released, or
+    /// foreign-instance receipt. A successful release admits only fresh replies:
+    /// results captured before the fence or while it was closed remain stale.
+    /// Other peers' fences and receipts remain in force. Cancellation after
+    /// dispatch may already have released the fence; repeating the same release
+    /// is harmless. This does not establish that a peer is safe to readmit.
+    pub async fn release_peer_response_fence(
+        &self,
+        fence: PeerResponseFence<C::NodeId>,
+    ) -> Result<bool, RaftError<C::NodeId>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::ReleasePeerResponseFence { fence, tx }, rx).await
     }
 
     /// Atomically stop campaigning and prepare this voter for planned shutdown.

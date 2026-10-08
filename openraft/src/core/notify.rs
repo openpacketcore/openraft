@@ -1,5 +1,8 @@
+use crate::core::raft_msg::ClientReadResult;
+use crate::core::raft_msg::ClientReadTx;
 use crate::core::sm;
 use crate::error::Fatal;
+use crate::peer_admission::ResponseGeneration;
 use crate::raft::VoteResponse;
 use crate::replication;
 use crate::MessageSummary;
@@ -12,6 +15,7 @@ where C: RaftTypeConfig
 {
     VoteResponse {
         target: C::NodeId,
+        generation: ResponseGeneration,
         resp: VoteResponse<C::NodeId>,
 
         /// The candidate that sent the vote request.
@@ -24,6 +28,7 @@ where C: RaftTypeConfig
     HigherVote {
         /// The ID of the target node from which the new term was observed.
         target: C::NodeId,
+        generation: ResponseGeneration,
 
         /// The higher vote observed.
         higher: Vote<C::NodeId>,
@@ -38,7 +43,17 @@ where C: RaftTypeConfig
     },
 
     /// Result of executing a command sent from network worker.
-    Network { response: replication::Response<C> },
+    Network {
+        generation: ResponseGeneration,
+        response: replication::Response<C>,
+    },
+
+    /// Quorum reads publish their result only after checking admission in core.
+    ReadResult {
+        generation: ResponseGeneration,
+        result: ClientReadResult<C>,
+        tx: ClientReadTx<C>,
+    },
 
     /// A replication task failed, including a panic in its owned snapshot child.
     ReplicationFatal { error: Fatal<C::NodeId> },
@@ -70,6 +85,7 @@ where C: RaftTypeConfig
                 target,
                 resp,
                 sender_vote: vote,
+                ..
             } => {
                 format!("VoteResponse: from: {}: {}, res-vote: {}", target, resp.summary(), vote)
             }
@@ -77,13 +93,15 @@ where C: RaftTypeConfig
                 ref target,
                 higher: ref new_vote,
                 sender_vote: ref vote,
+                ..
             } => {
                 format!(
                     "Seen a higher vote: target: {}, vote: {}, server_state_vote: {}",
                     target, new_vote, vote
                 )
             }
-            Self::Network { response } => {
+            Self::ReadResult { .. } => "ReadResult".to_string(),
+            Self::Network { response, .. } => {
                 format!("Replication command done: {}", response.summary())
             }
             Self::ReplicationFatal { error } => format!("Replication task failed: {}", error),

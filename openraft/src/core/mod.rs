@@ -21,3 +21,6 @@ pub(crate) use replication_state::replication_lag;
 pub use server_state::ServerState;
 pub(crate) use tick::Tick;
 pub(crate) use tick::TickHandle;
+
+#[cfg(test)]
+mod peer_admission_test;

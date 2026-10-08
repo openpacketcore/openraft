@@ -1,5 +1,7 @@
 //! Replication stream.
 
+use crate::peer_admission::ResponseGeneration;
+
 pub(crate) mod callbacks;
 pub(crate) mod hint;
 mod replication_session_id;
@@ -96,6 +98,7 @@ where
 
     /// Identifies which session this replication belongs to.
     session_id: ReplicationSessionId<C::NodeId>,
+    generation: ResponseGeneration,
 
     /// A channel for sending events to the RaftCore.
     #[allow(clippy::type_complexity)]
@@ -167,6 +170,7 @@ where
     pub(crate) fn spawn(
         target: C::NodeId,
         session_id: ReplicationSessionId<C::NodeId>,
+        generation: ResponseGeneration,
         config: Arc<Config>,
         committed: Option<LogId<C::NodeId>>,
         matching: Option<LogId<C::NodeId>>,
@@ -191,6 +195,7 @@ where
         let this = Self {
             target,
             session_id,
+            generation,
             network,
             snapshot_network: Arc::new(Mutex::new(snapshot_network)),
             snapshot_state: None,
@@ -222,6 +227,7 @@ where
         if let Err(error) = &result {
             let notification = match error {
                 Fatal::StorageError(error) => Notify::Network {
+                    generation: self.generation.clone(),
                     response: Response::StorageError { error: error.clone() },
                 },
                 _ => Notify::ReplicationFatal { error: error.clone() },
@@ -299,6 +305,7 @@ where
                         }
                         ReplicationError::HigherVote(h) => {
                             let _ = self.tx_raft_core.send(Notify::Network {
+                                generation: self.generation.clone(),
                                 response: Response::HigherVote {
                                     target: self.target.clone(),
                                     higher: h.higher,
@@ -586,6 +593,7 @@ where
     /// RaftCore will then submit another replication command.
     fn send_progress_error(&mut self, request_id: RequestId, err: RPCError<C::NodeId, C::Node>) {
         let _ = self.tx_raft_core.send(Notify::Network {
+            generation: self.generation.clone(),
             response: Response::Progress {
                 target: self.target.clone(),
                 request_id,
@@ -618,6 +626,7 @@ where
 
         let _ = self.tx_raft_core.send({
             Notify::Network {
+                generation: self.generation.clone(),
                 response: Response::Progress {
                     session_id: self.session_id.clone(),
                     request_id,
