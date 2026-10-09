@@ -27,7 +27,6 @@ impl<C: RaftTypeConfig> Engine<C> {
             || vote.leader_id().voted_for().as_ref() != Some(sender)
             || sender == &self.config.id
             || self.leader.is_some()
-            || self.prepared_shutdown.is_some()
         {
             return false;
         }
@@ -60,7 +59,10 @@ impl<C: RaftTypeConfig> Engine<C> {
         vote: Vote<C::NodeId>,
         membership_log_id: Option<LogId<C::NodeId>>,
     ) -> bool {
-        if !self.resignation_matches(&sender, &vote, &membership_log_id) || !self.state.vote.lease_disabled() {
+        if !self.resignation_matches(&sender, &vote, &membership_log_id)
+            || self.prepared_shutdown.is_some()
+            || !self.state.vote.lease_disabled()
+        {
             return false;
         }
         // Use the ordinary persist-before-send election path. The application

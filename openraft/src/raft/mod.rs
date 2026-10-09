@@ -567,8 +567,10 @@ where C: RaftTypeConfig
     ///
     /// Returns `true` only when `vote` is the receiver's exact committed vote,
     /// its leader is `sender`, and both nodes are voters of the same committed
-    /// stable membership identified by `membership_log_id`. A leader, a node
-    /// prepared for shutdown, or a sender with fenced responses is refused.
+    /// stable membership identified by `membership_log_id`. A local leader or
+    /// a sender with fenced responses is refused. A receiver prepared for
+    /// shutdown may release the lease so it can vote for a surviving candidate;
+    /// it remains unable to campaign itself.
     /// All refusal paths return `false` without effects. Repeated accepted
     /// releases are idempotent and neither write storage nor change the vote
     /// timestamp. An equal-vote heartbeat cannot restore the released lease;
@@ -601,9 +603,10 @@ where C: RaftTypeConfig
     /// Campaign only if the authenticated leader's resignation is still current.
     ///
     /// Rechecks every condition of [`Self::release_leader_lease`], including the
-    /// current sender response fence and local shutdown state, in one core turn.
-    /// The exact vote's lease must already be released. A changed vote or
-    /// membership, a leader, or a retiring node returns `false` without effects.
+    /// current sender response fence, and also refuses local shutdown state in
+    /// the same core turn. The exact vote's lease must already be released.
+    /// A changed vote or membership, a leader, or a retiring node returns
+    /// `false` without effects.
     ///
     /// An accepted call returns `true` and uses the ordinary election path:
     /// persist a self-vote in the next term before sending vote requests. Normal
@@ -611,6 +614,10 @@ where C: RaftTypeConfig
     /// of leadership or of a completed storage write. Cancellation after
     /// dispatch may already have started the election; a repeated call using
     /// the old vote then returns `false`.
+    ///
+    /// Like [`Trigger::elect`], this is not affected by `Raft::enable_elect(false)`.
+    /// The application must refuse resignation notices while elections are
+    /// disabled for recovery or admission fencing.
     pub async fn elect_if_leader_resigned(
         &self,
         sender: C::NodeId,

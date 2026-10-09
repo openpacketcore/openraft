@@ -83,7 +83,7 @@ async fn resign_commands_recheck_the_current_sender_response_fence() {
     .await;
     assert!(
         !rx.await.unwrap().unwrap(),
-        "a fence installed during the SDK delay must win"
+        "a fence installed during the application delay must win"
     );
     assert_eq!(before, core.engine.state);
     assert!(core.engine.output.take_commands().is_empty());

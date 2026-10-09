@@ -107,7 +107,7 @@ fn resign_releases_only_the_exact_lease_then_elects_without_an_applied_prefix() 
 }
 
 #[test]
-fn resign_wrong_sender_vote_membership_role_or_retirement_has_no_effect() {
+fn resign_wrong_sender_vote_membership_or_role_has_no_effect() {
     let exact = Vote::new_committed(5, 0);
     let membership = Some(log_id(2, 0, 1));
     for elect in [false, true] {
@@ -145,18 +145,120 @@ fn resign_wrong_sender_vote_membership_role_or_retirement_has_no_effect() {
             assert_eq!(before, receiver.state);
             assert!(receiver.output.take_commands().is_empty());
         }
-        let mut retiring = engine(1);
-        retiring.prepare_shutdown(None).unwrap();
-        retiring.state.vote.disable_lease();
-        let before = retiring.state.clone();
+    }
+}
+
+#[test]
+fn resign_release_grants_an_incoming_fresh_vote_and_invalidates_delayed_election() {
+    let mut receiver = engine(1);
+    let vote = Vote::new_committed(5, 0);
+    let membership = Some(log_id(2, 0, 1));
+    let candidate = Vote::new(6, 2);
+    let request = VoteRequest::new(candidate, Some(log_id(5, 0, 2)));
+    assert!(!receiver.handle_vote_req(request.clone()).vote_granted);
+    assert!(receiver.output.take_commands().is_empty());
+
+    assert!(receiver.release_leader_lease(0, vote, membership));
+    assert!(receiver.handle_vote_req(request).vote_granted);
+    assert_eq!(&candidate, receiver.state.vote_ref());
+    assert!(!receiver.state.vote.lease_disabled());
+    assert_eq!(
+        vec![Command::SaveVote { vote: candidate }],
+        receiver.output.take_commands()
+    );
+
+    let before = receiver.state.clone();
+    assert!(!receiver.elect_if_leader_resigned(0, vote, membership));
+    assert_eq!(before, receiver.state);
+    assert!(receiver.output.take_commands().is_empty());
+    receiver.state.validate().unwrap();
+}
+
+#[test]
+fn resign_rejects_an_exact_but_uncommitted_vote() {
+    let vote = Vote::new(6, 0);
+    let membership = Some(log_id(2, 0, 1));
+    for elect in [false, true] {
+        let mut receiver = engine(1);
+        receiver.vote_handler().update_vote(&vote).unwrap();
+        receiver.output.take_commands();
+        if elect {
+            receiver.state.vote.disable_lease();
+        }
+        receiver.state.validate().unwrap();
+        assert_eq!(&vote, receiver.state.vote_ref(), "the equality check must pass");
+        let before = receiver.state.clone();
         let accepted = if elect {
-            retiring.elect_if_leader_resigned(0, exact, membership)
+            receiver.elect_if_leader_resigned(0, vote, membership)
         } else {
-            retiring.release_leader_lease(0, exact, membership)
+            receiver.release_leader_lease(0, vote, membership)
         };
-        assert!(!accepted);
-        assert_eq!(before, retiring.state);
-        assert!(retiring.output.take_commands().is_empty());
+        assert!(!accepted, "only the committed-vote condition refuses this request");
+        assert_eq!(before, receiver.state);
+        assert!(receiver.output.take_commands().is_empty());
+        receiver.state.validate().unwrap();
+    }
+}
+
+#[test]
+fn resign_rejects_a_sender_that_is_no_longer_a_voter() {
+    let vote = Vote::new_committed(5, 0);
+    let membership = Some(log_id(5, 0, 2));
+    for elect in [false, true] {
+        let mut receiver = engine(1);
+        let effective = Arc::new(EffectiveMembership::new(
+            membership,
+            Membership::new(vec![btreeset! {1, 2, 3}], None),
+        ));
+        receiver.state.membership_state = MembershipState::new(effective.clone(), effective);
+        if elect {
+            receiver.state.vote.disable_lease();
+        }
+        receiver.state.validate().unwrap();
+        let before = receiver.state.clone();
+        let accepted = if elect {
+            receiver.elect_if_leader_resigned(0, vote, membership)
+        } else {
+            receiver.release_leader_lease(0, vote, membership)
+        };
+        assert!(!accepted, "only the sender-voter condition refuses this request");
+        assert_eq!(before, receiver.state);
+        assert!(receiver.output.take_commands().is_empty());
+        receiver.state.validate().unwrap();
+    }
+}
+
+#[test]
+fn resign_retiring_receiver_releases_and_votes_but_never_campaigns() {
+    let vote = Vote::new_committed(5, 0);
+    let membership = Some(log_id(2, 0, 1));
+    for release_before_retirement in [false, true] {
+        let mut receiver = engine(1);
+        if release_before_retirement {
+            assert!(receiver.release_leader_lease(0, vote, membership));
+        }
+        receiver.prepare_shutdown(None).unwrap();
+        let mut expected = receiver.state.clone();
+        expected.vote.disable_lease();
+        assert!(receiver.release_leader_lease(0, vote, membership));
+        assert_eq!(
+            expected, receiver.state,
+            "retirement permits only the volatile lease release"
+        );
+        assert!(receiver.output.take_commands().is_empty());
+        assert!(!receiver.elect_if_leader_resigned(0, vote, membership));
+        assert_eq!(expected, receiver.state);
+        assert!(receiver.candidate_ref().is_none());
+        assert!(receiver.output.take_commands().is_empty());
+
+        let candidate = Vote::new(6, 2);
+        assert!(receiver.handle_vote_req(VoteRequest::new(candidate, Some(log_id(5, 0, 2)))).vote_granted);
+        assert_eq!(
+            vec![Command::SaveVote { vote: candidate }],
+            receiver.output.take_commands()
+        );
+        assert!(receiver.candidate_ref().is_none());
+        receiver.state.validate().unwrap();
     }
 }
 
