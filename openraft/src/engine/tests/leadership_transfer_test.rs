@@ -63,6 +63,173 @@ fn request() -> TransferLeaderRequest<u64> {
     engine(0).begin_leadership_transfer(1).unwrap()
 }
 
+#[test]
+fn resign_releases_only_the_exact_lease_then_elects_without_an_applied_prefix() {
+    let mut receiver = engine(1);
+    let vote = Vote::new_committed(5, 0);
+    let membership = Some(log_id(2, 0, 1));
+    receiver.state.io_state = IOState::new(
+        vote,
+        LogIOId::new(CommittedLeaderId::new(5, 0), Some(log_id(5, 0, 2))),
+        Some(log_id(2, 0, 1)),
+        None,
+        None,
+    );
+    receiver.state.validate().unwrap();
+    let before = receiver.state.clone();
+    assert!(receiver.release_leader_lease(0, vote, membership));
+    assert!(
+        receiver.release_leader_lease(0, vote, membership),
+        "release is idempotent"
+    );
+    assert_eq!(before.vote_ref(), receiver.state.vote_ref());
+    assert_eq!(before.vote_last_modified(), receiver.state.vote_last_modified());
+    assert_eq!(before.io_state, receiver.state.io_state);
+    assert_eq!(before.log_ids, receiver.state.log_ids);
+    assert!(receiver.output.take_commands().is_empty());
+    receiver.vote_handler().update_vote(&vote).unwrap();
+    assert!(
+        receiver.state.vote.lease_disabled(),
+        "old heartbeats cannot restore the lease"
+    );
+    assert!(receiver.elect_if_leader_resigned(0, vote, membership));
+    assert_eq!(&Vote::new(6, 1), receiver.state.vote_ref());
+    assert_eq!(
+        vec![Command::SaveVote { vote: Vote::new(6, 1) }, Command::SendVote {
+            vote_req: VoteRequest::new(Vote::new(6, 1), Some(log_id(5, 0, 2)))
+        }],
+        receiver.output.take_commands(),
+        "conditional election retains the ordinary persist-before-send commands"
+    );
+    assert!(!receiver.elect_if_leader_resigned(0, vote, membership));
+    assert!(receiver.output.take_commands().is_empty());
+    receiver.state.validate().unwrap();
+}
+
+#[test]
+fn resign_wrong_sender_vote_membership_role_or_retirement_has_no_effect() {
+    let exact = Vote::new_committed(5, 0);
+    let membership = Some(log_id(2, 0, 1));
+    for elect in [false, true] {
+        for (sender, vote, membership) in [
+            (2, exact, membership),
+            (0, Vote::new_committed(4, 0), membership),
+            (0, Vote::new_committed(6, 0), membership),
+            (0, Vote::new(5, 0), membership),
+            (2, Vote::new_committed(5, 2), membership),
+            (0, exact, None),
+            (0, exact, Some(log_id(1, 0, 1))),
+        ] {
+            let mut receiver = engine(1);
+            receiver.state.vote.disable_lease();
+            let before = receiver.state.clone();
+            let accepted = if elect {
+                receiver.elect_if_leader_resigned(sender, vote, membership)
+            } else {
+                receiver.release_leader_lease(sender, vote, membership)
+            };
+            assert!(!accepted);
+            assert_eq!(before, receiver.state);
+            assert!(receiver.output.take_commands().is_empty());
+        }
+        for id in [0, 3] {
+            let mut receiver = engine(id);
+            receiver.state.vote.disable_lease();
+            let before = receiver.state.clone();
+            let accepted = if elect {
+                receiver.elect_if_leader_resigned(0, exact, membership)
+            } else {
+                receiver.release_leader_lease(0, exact, membership)
+            };
+            assert!(!accepted, "leaders and learners cannot consume resignation");
+            assert_eq!(before, receiver.state);
+            assert!(receiver.output.take_commands().is_empty());
+        }
+        let mut retiring = engine(1);
+        retiring.prepare_shutdown(None).unwrap();
+        retiring.state.vote.disable_lease();
+        let before = retiring.state.clone();
+        let accepted = if elect {
+            retiring.elect_if_leader_resigned(0, exact, membership)
+        } else {
+            retiring.release_leader_lease(0, exact, membership)
+        };
+        assert!(!accepted);
+        assert_eq!(before, retiring.state);
+        assert!(retiring.output.take_commands().is_empty());
+    }
+}
+
+#[test]
+fn resign_conditional_election_rechecks_scope_vote_and_lease_release() {
+    let vote = Vote::new_committed(5, 0);
+    let membership = Some(log_id(2, 0, 1));
+    let mut untouched = engine(1);
+    let before = untouched.state.clone();
+    assert!(!untouched.elect_if_leader_resigned(0, vote, membership));
+    assert_eq!(before, untouched.state, "the lease must have been released first");
+
+    for changed_vote in [false, true] {
+        let mut receiver = engine(1);
+        assert!(receiver.release_leader_lease(0, vote, membership));
+        if changed_vote {
+            receiver.vote_handler().update_vote(&Vote::new_committed(6, 2)).unwrap();
+        } else {
+            let replacement = Arc::new(EffectiveMembership::new(
+                Some(log_id(5, 0, 2)),
+                Membership::new(vec![btreeset! {0, 1, 2}], None),
+            ));
+            receiver.state.membership_state = MembershipState::new(replacement.clone(), replacement);
+        }
+        receiver.output.take_commands();
+        let before = receiver.state.clone();
+        assert!(!receiver.elect_if_leader_resigned(0, vote, membership));
+        assert_eq!(
+            before, receiver.state,
+            "the delayed command cannot act on a newer scope or vote"
+        );
+        assert!(receiver.output.take_commands().is_empty());
+        receiver.state.validate().unwrap();
+    }
+}
+
+#[test]
+fn resign_never_weakens_log_freshness_or_admits_joint_membership() {
+    let vote = Vote::new_committed(5, 0);
+    let membership = Some(log_id(2, 0, 1));
+    let mut receiver = engine(1);
+    assert!(receiver.release_leader_lease(0, vote, membership));
+    assert!(!receiver.handle_vote_req(VoteRequest::new(Vote::new(6, 2), Some(log_id(2, 0, 1)))).vote_granted);
+    assert_eq!(&vote, receiver.state.vote_ref());
+    assert!(receiver.output.take_commands().is_empty());
+    for joint in [false, true] {
+        let mut receiver = engine(1);
+        let changed = Arc::new(EffectiveMembership::new(
+            Some(log_id(5, 0, 2)),
+            Membership::new(
+                if joint {
+                    vec![btreeset! {0, 1, 2}, btreeset! {0, 1, 3}]
+                } else {
+                    vec![btreeset! {0, 1, 2}]
+                },
+                None,
+            ),
+        ));
+        let committed = if joint {
+            changed.clone()
+        } else {
+            receiver.state.membership_state.committed().clone()
+        };
+        receiver.state.membership_state = MembershipState::new(committed, changed);
+        receiver.state.vote.disable_lease();
+        let before = receiver.state.clone();
+        assert!(!receiver.release_leader_lease(0, vote, Some(log_id(5, 0, 2))));
+        assert!(!receiver.elect_if_leader_resigned(0, vote, Some(log_id(5, 0, 2))));
+        assert_eq!(before, receiver.state);
+        assert!(receiver.output.take_commands().is_empty());
+    }
+}
+
 fn assert_refused(engine: &mut Engine<UTConfig>, request: TransferLeaderRequest<u64>, error: TransferLeaderError) {
     let before = engine.state.clone();
     assert_eq!(Err(error), engine.handle_leadership_transfer(request));

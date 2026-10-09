@@ -557,6 +557,80 @@ where C: RaftTypeConfig
         self.inner.call_core(RaftMsg::HandleLeadershipTransfer { request, tx }, rx).await
     }
 
+    /// Release the election lease of an authenticated, resigning current leader.
+    ///
+    /// The application must authenticate `sender`, gate inbound admission, and
+    /// ensure that the resigning leader has stopped serving reads and proposals
+    /// before delivering its notice. This primitive does not authenticate the
+    /// caller or retire the sender. It is intended for a sender that cannot use
+    /// its own core, for example after a terminal storage failure.
+    ///
+    /// Returns `true` only when `vote` is the receiver's exact committed vote,
+    /// its leader is `sender`, and both nodes are voters of the same committed
+    /// stable membership identified by `membership_log_id`. A leader, a node
+    /// prepared for shutdown, or a sender with fenced responses is refused.
+    /// All refusal paths return `false` without effects. Repeated accepted
+    /// releases are idempotent and neither write storage nor change the vote
+    /// timestamp. An equal-vote heartbeat cannot restore the released lease;
+    /// a new vote gets an ordinary lease.
+    ///
+    /// This does not campaign or alter ordinary election timeouts. The
+    /// application owns bounded scheduling and deduplication before calling
+    /// [`Self::elect_if_leader_resigned`]. Cancellation after dispatch may have
+    /// released the lease; repeating the exact request is harmless.
+    pub async fn release_leader_lease(
+        &self,
+        sender: C::NodeId,
+        vote: Vote<C::NodeId>,
+        membership_log_id: Option<LogId<C::NodeId>>,
+    ) -> Result<bool, RaftError<C::NodeId>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner
+            .call_core(
+                RaftMsg::ReleaseLeaderLease {
+                    sender,
+                    vote,
+                    membership_log_id,
+                    tx,
+                },
+                rx,
+            )
+            .await
+    }
+
+    /// Campaign only if the authenticated leader's resignation is still current.
+    ///
+    /// Rechecks every condition of [`Self::release_leader_lease`], including the
+    /// current sender response fence and local shutdown state, in one core turn.
+    /// The exact vote's lease must already be released. A changed vote or
+    /// membership, a leader, or a retiring node returns `false` without effects.
+    ///
+    /// An accepted call returns `true` and uses the ordinary election path:
+    /// persist a self-vote in the next term before sending vote requests. Normal
+    /// log freshness and quorum rules decide the winner. `true` is not evidence
+    /// of leadership or of a completed storage write. Cancellation after
+    /// dispatch may already have started the election; a repeated call using
+    /// the old vote then returns `false`.
+    pub async fn elect_if_leader_resigned(
+        &self,
+        sender: C::NodeId,
+        vote: Vote<C::NodeId>,
+        membership_log_id: Option<LogId<C::NodeId>>,
+    ) -> Result<bool, RaftError<C::NodeId>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner
+            .call_core(
+                RaftMsg::ElectIfLeaderResigned {
+                    sender,
+                    vote,
+                    membership_log_id,
+                    tx,
+                },
+                rx,
+            )
+            .await
+    }
+
     /// Get the latest snapshot from the state machine.
     ///
     /// It returns error only when `RaftCore` fails to serve the request, e.g., Encountering a

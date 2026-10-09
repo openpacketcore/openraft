@@ -1408,6 +1408,26 @@ where
                 let result = self.engine.handle_leadership_transfer(request);
                 let _ = tx.send(result);
             }
+            RaftMsg::ReleaseLeaderLease {
+                sender,
+                vote,
+                membership_log_id,
+                tx,
+            } => {
+                let accepted = self.peer_admission.allows(&sender)
+                    && self.engine.release_leader_lease(sender, vote, membership_log_id);
+                let _ = tx.send(Ok(accepted));
+            }
+            RaftMsg::ElectIfLeaderResigned {
+                sender,
+                vote,
+                membership_log_id,
+                tx,
+            } => {
+                let accepted = self.peer_admission.allows(&sender)
+                    && self.engine.elect_if_leader_resigned(sender, vote, membership_log_id);
+                let _ = tx.send(Ok(accepted));
+            }
             RaftMsg::ExternalCoreRequest { req } => {
                 req(&self.engine.state);
             }

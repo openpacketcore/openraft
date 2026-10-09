@@ -36,6 +36,76 @@ use crate::StorageIOError;
 
 type Core = RaftCore<TestConfig, Network, MemoryStore, MemoryStore>;
 
+#[tokio::test]
+async fn resign_commands_recheck_the_current_sender_response_fence() {
+    let mut core = core(&[1, 2, 3], false);
+    let vote = Vote::new_committed(6, 3);
+    core.engine.state.vote = UTime::new(TestConfig::now(), vote);
+    core.engine.candidate = None;
+    core.engine.state.server_state = crate::ServerState::Follower;
+    let receipt = fence(&mut core, 3).await;
+    core.engine.output.take_commands();
+    let before = core.engine.state.clone();
+    let (tx, rx) = TestConfig::oneshot();
+    core.handle_api_msg(RaftMsg::ReleaseLeaderLease {
+        sender: 3,
+        vote,
+        membership_log_id: Some(log(0)),
+        tx,
+    })
+    .await;
+    assert!(!rx.await.unwrap().unwrap());
+    assert_eq!(before, core.engine.state);
+    assert!(core.engine.output.take_commands().is_empty());
+
+    release(&mut core, receipt).await;
+    let (tx, rx) = TestConfig::oneshot();
+    core.handle_api_msg(RaftMsg::ReleaseLeaderLease {
+        sender: 3,
+        vote,
+        membership_log_id: Some(log(0)),
+        tx,
+    })
+    .await;
+    assert!(rx.await.unwrap().unwrap());
+    assert!(core.engine.state.vote.lease_disabled());
+
+    let receipt = fence(&mut core, 3).await;
+    core.engine.output.take_commands();
+    let before = core.engine.state.clone();
+    let (tx, rx) = TestConfig::oneshot();
+    core.handle_api_msg(RaftMsg::ElectIfLeaderResigned {
+        sender: 3,
+        vote,
+        membership_log_id: Some(log(0)),
+        tx,
+    })
+    .await;
+    assert!(
+        !rx.await.unwrap().unwrap(),
+        "a fence installed during the SDK delay must win"
+    );
+    assert_eq!(before, core.engine.state);
+    assert!(core.engine.output.take_commands().is_empty());
+
+    release(&mut core, receipt).await;
+    core.engine.output.take_commands();
+    let (tx, rx) = TestConfig::oneshot();
+    core.handle_api_msg(RaftMsg::ElectIfLeaderResigned {
+        sender: 3,
+        vote,
+        membership_log_id: Some(log(0)),
+        tx,
+    })
+    .await;
+    assert!(rx.await.unwrap().unwrap());
+    assert_eq!(core.engine.state.vote_ref(), &Vote::new(7, 1));
+    assert!(matches!(core.engine.output.take_commands().as_slice(), [
+        crate::engine::Command::SaveVote { .. },
+        crate::engine::Command::SendVote { .. }
+    ]));
+}
+
 fn log(index: u64) -> LogId<u64> {
     LogId::new(CommittedLeaderId::new(5, 1), index)
 }

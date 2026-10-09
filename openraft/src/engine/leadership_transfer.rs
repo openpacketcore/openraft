@@ -1,11 +1,13 @@
-//! Planned handoff uses the engine's normal election and persistence path.
+//! Planned handoff and exact-vote resignation use ordinary elections.
 
 use crate::engine::Engine;
 use crate::raft::TransferLeaderError;
 use crate::raft::TransferLeaderRequest;
 use crate::raft_state::LogStateReader;
+use crate::LogId;
 use crate::NodeId;
 use crate::RaftTypeConfig;
+use crate::Vote;
 
 /// Monotonic, process-local retirement; replication and voting remain available.
 #[derive(Debug)]
@@ -14,6 +16,59 @@ pub(crate) struct PreparedShutdown<NID: NodeId> {
 }
 
 impl<C: RaftTypeConfig> Engine<C> {
+    fn resignation_matches(
+        &self,
+        sender: &C::NodeId,
+        vote: &Vote<C::NodeId>,
+        membership_log_id: &Option<LogId<C::NodeId>>,
+    ) -> bool {
+        if !vote.is_committed()
+            || vote != self.state.vote_ref()
+            || vote.leader_id().voted_for().as_ref() != Some(sender)
+            || sender == &self.config.id
+            || self.leader.is_some()
+            || self.prepared_shutdown.is_some()
+        {
+            return false;
+        }
+        let membership = self.state.membership_state.effective();
+        membership.membership().get_joint_config().len() == 1
+            && membership.log_id() == self.state.membership_state.committed().log_id()
+            && membership.log_id() == membership_log_id
+            && membership.is_voter(sender)
+            && membership.is_voter(&self.config.id)
+    }
+
+    pub(crate) fn release_leader_lease(
+        &mut self,
+        sender: C::NodeId,
+        vote: Vote<C::NodeId>,
+        membership_log_id: Option<LogId<C::NodeId>>,
+    ) -> bool {
+        if !self.resignation_matches(&sender, &vote, &membership_log_id) {
+            return false;
+        }
+        // Neither the vote nor its timestamp changes. Equal-vote heartbeats
+        // cannot restore this lease; any newer vote has its ordinary lease.
+        self.state.vote.disable_lease();
+        true
+    }
+
+    pub(crate) fn elect_if_leader_resigned(
+        &mut self,
+        sender: C::NodeId,
+        vote: Vote<C::NodeId>,
+        membership_log_id: Option<LogId<C::NodeId>>,
+    ) -> bool {
+        if !self.resignation_matches(&sender, &vote, &membership_log_id) || !self.state.vote.lease_disabled() {
+            return false;
+        }
+        // Use the ordinary persist-before-send election path. The application
+        // owns its delay; rechecking here closes the intervening vote race.
+        self.elect();
+        true
+    }
+
     pub(crate) fn prepare_shutdown(
         &mut self,
         to: Option<C::NodeId>,

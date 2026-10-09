@@ -125,6 +125,20 @@ where C: RaftTypeConfig
         tx: ResultSender<C, (), TransferLeaderError>,
     },
 
+    ReleaseLeaderLease {
+        sender: C::NodeId,
+        vote: Vote<C::NodeId>,
+        membership_log_id: Option<LogIdOf<C>>,
+        tx: ResultSender<C, bool>,
+    },
+
+    ElectIfLeaderResigned {
+        sender: C::NodeId,
+        vote: Vote<C::NodeId>,
+        membership_log_id: Option<LogIdOf<C>>,
+        tx: ResultSender<C, bool>,
+    },
+
     ExternalCoreRequest {
         req: BoxCoreFn<C>,
     },
@@ -166,6 +180,8 @@ where C: RaftTypeConfig
             RaftMsg::BeginLeadershipTransfer { .. } => "BeginLeadershipTransfer".to_string(),
             RaftMsg::PrepareShutdown { .. } => "PrepareShutdown".to_string(),
             RaftMsg::HandleLeadershipTransfer { .. } => "HandleLeadershipTransfer".to_string(),
+            RaftMsg::ReleaseLeaderLease { .. } => "ReleaseLeaderLease".to_string(),
+            RaftMsg::ElectIfLeaderResigned { .. } => "ElectIfLeaderResigned".to_string(),
             RaftMsg::ExternalCoreRequest { .. } => "External Request".to_string(),
             RaftMsg::ExternalCommand { cmd } => {
                 format!("ExternalCommand: {:?}", cmd)
