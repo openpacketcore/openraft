@@ -622,4 +622,5 @@ async fn fence_receipts_are_scoped_and_do_not_shrink_the_quorum() {
     other.shutdown().await.unwrap();
 }
 
+mod participation_api;
 mod queued;

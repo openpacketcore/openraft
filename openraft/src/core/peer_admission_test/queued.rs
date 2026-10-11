@@ -36,6 +36,8 @@ use crate::StorageIOError;
 
 type Core = RaftCore<TestConfig, Network, MemoryStore, MemoryStore>;
 
+mod participation;
+
 #[tokio::test]
 async fn resign_commands_recheck_the_current_sender_response_fence() {
     let mut core = core(&[1, 2, 3], false);

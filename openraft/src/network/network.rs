@@ -44,6 +44,24 @@ where C: RaftTypeConfig
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>;
 
+    /// Send a replication-stream append with optional remote process identity.
+    ///
+    /// Return the identity carried by this particular response, not a cached
+    /// identity from another RPC. Its opaque bytes are application observation
+    /// data and do not affect Raft authority, votes or commit rules. Existing
+    /// transports can leave this method unchanged and remain unobserved.
+    ///
+    /// Replication uses this method for data and empty heartbeats. Read-quorum
+    /// probes use [`Self::append_entries`] and never supply participation evidence.
+    async fn append_entries_with_runtime(
+        &mut self,
+        rpc: AppendEntriesRequest<C>,
+        option: RPCOption,
+    ) -> Result<(AppendEntriesResponse<C::NodeId>, Option<[u8; 16]>), RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+    {
+        self.append_entries(rpc, option).await.map(|response| (response, None))
+    }
+
     /// Send an InstallSnapshot RPC to the target.
     #[cfg(feature = "generic-snapshot-data")]
     #[deprecated(

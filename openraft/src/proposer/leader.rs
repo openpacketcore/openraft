@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::display_ext::DisplaySliceExt;
@@ -5,6 +6,7 @@ use crate::progress::entry::ProgressEntry;
 use crate::progress::Progress;
 use crate::progress::VecProgress;
 use crate::quorum::QuorumSet;
+use crate::replication::PeerParticipation;
 use crate::type_config::alias::InstantOf;
 use crate::type_config::alias::LogIdOf;
 use crate::Instant;
@@ -58,6 +60,10 @@ where C: RaftTypeConfig
     ///
     /// [`docs::leader_lease`]: `crate::docs::protocol::replication::leader_lease`
     pub(crate) clock_progress: VecProgress<C::NodeId, Option<InstantOf<C>>, Option<InstantOf<C>>, QS>,
+
+    /// Volatile process observations, bounded by the current membership.
+    /// Replacing this leader state discards the whole observation context.
+    pub(crate) participation: BTreeMap<C::NodeId, PeerParticipation<C>>,
 }
 
 impl<C, QS> Leader<C, QS>
@@ -122,6 +128,7 @@ where
                 ProgressEntry::empty(last_log_id.next_index()),
             ),
             clock_progress: VecProgress::new(quorum_set, learner_ids, None),
+            participation: BTreeMap::new(),
         }
     }
 

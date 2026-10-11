@@ -14,6 +14,7 @@ use crate::proposer::LeaderQuorumSet;
 use crate::raft_state::LogStateReader;
 use crate::replication::request_id::RequestId;
 use crate::replication::response::ReplicationResult;
+use crate::replication::PeerParticipation;
 use crate::type_config::alias::InstantOf;
 use crate::AsyncRuntime;
 use crate::EffectiveMembership;
@@ -99,6 +100,8 @@ where C: RaftTypeConfig
     pub(crate) fn rebuild_progresses(&mut self) {
         let em = self.state.membership_state.effective();
 
+        self.leader.participation.retain(|peer, _| em.get_node(peer).is_some());
+
         let learner_ids = em.learner_ids().collect::<Vec<_>>();
 
         {
@@ -127,6 +130,8 @@ where C: RaftTypeConfig
         request_id: RequestId,
         result: ReplicationResult<C>,
     ) {
+        self.observe_participation(&target, request_id, &result);
+
         // No matter what the result is, the validity of the leader is granted by a follower.
         self.update_leader_clock(target.clone(), result.sending_time);
 
@@ -148,6 +153,33 @@ where C: RaftTypeConfig
                 self.update_conflicting(target, id, conflict);
             }
         }
+    }
+
+    /// Observe only an accepted append, before its acknowledgement can advance commit.
+    /// Generation, vote and membership-session checks have already run in the core.
+    fn observe_participation(&mut self, target: &C::NodeId, request_id: RequestId, result: &ReplicationResult<C>) {
+        let Some(runtime_id) = result.runtime_id else {
+            return;
+        };
+        if target == &self.config.id || self.state.membership_state.effective().get_node(target).is_none() {
+            return;
+        }
+        match request_id {
+            RequestId::Snapshot { .. } => return,
+            RequestId::AppendEntries { .. } if !self.leader.progress.get(target).inflight.is_my_id(request_id) => {
+                return;
+            }
+            _ => {}
+        }
+
+        // The same rule as LeaderHandler::get_read_log_id(), sampled before
+        // update_matching() has a chance to advance the committed position.
+        let catch_up = std::cmp::max(self.state.committed().cloned(), self.leader.noop_log_id.clone());
+        self.leader
+            .participation
+            .entry(target.clone())
+            .or_insert_with(|| PeerParticipation::new(runtime_id, result.sending_time, catch_up.clone()))
+            .observe(runtime_id, result.sending_time, catch_up, &result.result);
     }
 
     /// Update progress when replicated data(logs or snapshot) matches on follower/learner and is

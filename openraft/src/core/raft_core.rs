@@ -1289,6 +1289,9 @@ where
             candidate.revoke_grant(peer);
         }
         if let Some(leader) = &mut self.engine.leader {
+            if let Some(participation) = leader.participation.get_mut(peer) {
+                participation.fence();
+            }
             let minimum = ProgressEntry::empty(leader.last_log_id().next_index());
             leader.progress.reset(peer, minimum);
             leader.clock_progress.reset(peer, None);
@@ -1325,6 +1328,22 @@ where
         tracing::debug!("recv from rx_api: {}", msg.summary());
 
         match msg {
+            RaftMsg::ReadReplication { tx } => {
+                let result = self.engine.leader_handler().map(|leader| crate::ReplicationReadback {
+                    vote: leader.leader.vote.clone(),
+                    membership: leader.state.membership_state.effective().clone(),
+                    committed: leader.state.committed().cloned(),
+                    observations: leader
+                        .leader
+                        .participation
+                        .iter()
+                        .filter_map(|(peer, entry)| {
+                            entry.visible().map(|observation| (peer.clone(), observation.clone()))
+                        })
+                        .collect(),
+                });
+                let _ = tx.send(result);
+            }
             RaftMsg::FencePeerResponses { peer, tx } => {
                 if peer == self.id {
                     let _ = tx.send(Err(PeerResponseFenceError::LocalNode));

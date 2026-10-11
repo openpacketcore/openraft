@@ -61,6 +61,8 @@ use crate::StorageError;
 use crate::StorageIOError;
 use crate::Vote;
 
+mod participation;
+
 const RETRY: Duration = Duration::from_millis(10);
 const UNREACHABLE_RETRY: Duration = Duration::from_millis(37);
 const RPC_TIMEOUT: Duration = Duration::from_millis(100);
@@ -194,6 +196,33 @@ struct Wire {
     requests: Vec<AppendEntriesRequest<C>>,
     completed: usize,
     backoffs: usize,
+    replication_inflight: usize,
+    replication_calls: usize,
+}
+
+struct ReplicationAppend(Arc<Mutex<Wire>>);
+
+impl ReplicationAppend {
+    fn enter(wire: Arc<Mutex<Wire>>) -> Self {
+        let previous = {
+            let mut state = wire.lock().unwrap();
+            let previous = state.replication_inflight;
+            state.replication_inflight += 1;
+            state.replication_calls += 1;
+            previous
+        };
+        assert_eq!(
+            previous, 0,
+            "a second replication-stream append is in flight to the same peer"
+        );
+        Self(wire)
+    }
+}
+
+impl Drop for ReplicationAppend {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().replication_inflight -= 1;
+    }
 }
 
 struct ReadyNetwork {
@@ -201,9 +230,22 @@ struct ReadyNetwork {
     follower: ReadyStore,
     replies: VecDeque<Reply>,
     second_gate: Option<oneshot::Receiver<()>>,
+    runtime_id: Option<[u8; 16]>,
 }
 
 impl RaftNetwork<C> for ReadyNetwork {
+    async fn append_entries_with_runtime(
+        &mut self,
+        rpc: AppendEntriesRequest<C>,
+        option: RPCOption,
+    ) -> Result<(AppendEntriesResponse<u64>, Option<[u8; 16]>), RPCError<u64, (), RaftError<u64>>> {
+        // Read-quorum probes call append_entries directly. Empty stream
+        // heartbeats go through this method and count against the same peer.
+        let _active = ReplicationAppend::enter(self.wire.clone());
+        let response = self.append_entries(rpc, option).await?;
+        Ok((response, self.runtime_id))
+    }
+
     async fn append_entries(&mut self, rpc: AppendEntriesRequest<C>, _option: RPCOption) -> AppendResult {
         let arrival = {
             let mut wire = self.wire.lock().unwrap();
@@ -320,6 +362,16 @@ impl Run {
         gate_second: bool,
         heartbeat_interval: u64,
     ) -> Self {
+        Self::with_settings(prev, replies, gate_second, heartbeat_interval, None).await
+    }
+
+    async fn with_settings(
+        prev: Option<LogId<u64>>,
+        replies: Vec<Reply>,
+        gate_second: bool,
+        heartbeat_interval: u64,
+        runtime_id: Option<[u8; 16]>,
+    ) -> Self {
         let mut leader = ReadyStore::default();
         leader.blocking_append(entries()).await.unwrap();
         let mut follower = ReadyStore::default();
@@ -336,12 +388,14 @@ impl Run {
             follower: follower.clone(),
             replies: replies.into(),
             second_gate: gate_second.then_some(gate),
+            runtime_id,
         };
         let snapshot_network = ReadyNetwork {
             wire: wire.clone(),
             follower: follower.clone(),
             replies: VecDeque::new(),
             second_gate: None,
+            runtime_id: None,
         };
         let (tx, rx_event) = mpsc::unbounded_channel();
         let (tx_raft_core, rx) = mpsc::unbounded_channel();

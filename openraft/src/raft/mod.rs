@@ -65,6 +65,7 @@ use crate::engine::EngineConfig;
 use crate::error::CheckIsLeaderError;
 use crate::error::ClientWriteError;
 use crate::error::Fatal;
+use crate::error::ForwardToLeader;
 use crate::error::Infallible;
 use crate::error::InitializeError;
 use crate::error::RaftError;
@@ -1010,6 +1011,20 @@ where C: RaftTypeConfig
 
         // Not up to date, keep waiting.
         Err(())
+    }
+
+    /// Capture the local leader's accepted replication observations and Raft state.
+    ///
+    /// The capture is serialized with response acceptance, fencing, membership and
+    /// commit updates. A follower forwards to its current leader; a stopped engine
+    /// returns a fatal error. See [`crate::ReplicationReadback`] for the fresh
+    /// quorum round and same-leader check required after capture. This method does
+    /// not send RPCs, wait for local apply, or establish a quorum proof itself.
+    pub async fn replication_readback(
+        &self,
+    ) -> Result<crate::ReplicationReadback<C>, RaftError<C::NodeId, ForwardToLeader<C::NodeId, C::Node>>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::ReadReplication { tx }, rx).await
     }
 
     /// Provides read-only access to [`RaftState`] through a user-provided function.

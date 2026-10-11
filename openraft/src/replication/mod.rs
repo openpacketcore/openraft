@@ -4,10 +4,15 @@ use crate::peer_admission::ResponseGeneration;
 
 pub(crate) mod callbacks;
 pub(crate) mod hint;
+mod observation;
 mod replication_session_id;
 pub(crate) mod request;
 pub(crate) mod request_id;
 pub(crate) mod response;
+
+pub(crate) use observation::PeerParticipation;
+pub use observation::ReplicationObservation;
+pub use observation::ReplicationReadback;
 
 #[cfg(test)]
 mod no_progress_test;
@@ -523,7 +528,7 @@ where
 
         let the_timeout = Duration::from_millis(self.config.heartbeat_interval);
         let option = RPCOption::new(the_timeout);
-        let res = C::timeout(the_timeout, self.network.append_entries(payload, option)).await;
+        let res = C::timeout(the_timeout, self.network.append_entries_with_runtime(payload, option)).await;
 
         tracing::debug!("append_entries res: {:?}", res);
 
@@ -537,7 +542,7 @@ where
             RPCError::Timeout(to)
         })?; // return Timeout error
 
-        let append_resp = DecomposeResult::<C, _, _>::decompose_infallible(append_res)?;
+        let (append_resp, runtime_id) = DecomposeResult::<C, _, _>::decompose_infallible(append_res)?;
 
         tracing::debug!(
             req = display(&sending_range),
@@ -548,7 +553,7 @@ where
         match append_resp {
             AppendEntriesResponse::Success => {
                 let matching = sending_range.last;
-                let next = self.finish_success_append(matching, leader_time, log_ids);
+                let next = self.finish_success_append(matching, leader_time, runtime_id, log_ids);
                 Ok(next)
             }
             AppendEntriesResponse::PartialSuccess(matching) => {
@@ -560,7 +565,7 @@ where
                     let retry_millis = self.config.heartbeat_interval.clamp(1, 10);
                     *retry_at = Some(leader_time + Duration::from_millis(retry_millis));
                 }
-                let next = self.finish_success_append(matching, leader_time, log_ids);
+                let next = self.finish_success_append(matching, leader_time, runtime_id, log_ids);
                 Ok(next)
             }
             AppendEntriesResponse::HigherVote(vote) => {
@@ -582,7 +587,10 @@ where
                 debug_assert!(conflict.is_some(), "prev_log_id=None never conflict");
 
                 let conflict = conflict.unwrap();
-                self.send_progress(request_id, ReplicationResult::new(leader_time, Err(conflict)));
+                self.send_progress(
+                    request_id,
+                    ReplicationResult::new(leader_time, Err(conflict)).with_runtime_id(runtime_id),
+                );
 
                 Ok(None)
             }
@@ -955,6 +963,7 @@ where
         &mut self,
         matching: Option<LogId<C::NodeId>>,
         leader_time: InstantOf<C>,
+        runtime_id: Option<[u8; 16]>,
         log_ids: DataWithId<LogIdRange<C::NodeId>>,
     ) -> Option<Data<C>> {
         // An empty first-range read or a partial response can acknowledge the
@@ -967,7 +976,7 @@ where
         };
         self.send_progress(
             progress_request_id,
-            ReplicationResult::new(leader_time, Ok(matching.clone())),
+            ReplicationResult::new(leader_time, Ok(matching.clone())).with_runtime_id(runtime_id),
         );
 
         if matching < log_ids.data().last {

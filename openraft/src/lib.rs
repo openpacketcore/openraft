@@ -105,6 +105,8 @@ pub use crate::raft_state::MembershipState;
 pub use crate::raft_state::RaftState;
 pub use crate::raft_types::SnapshotId;
 pub use crate::raft_types::SnapshotSegmentId;
+pub use crate::replication::ReplicationObservation;
+pub use crate::replication::ReplicationReadback;
 pub use crate::storage::LogState;
 pub use crate::storage::RaftLogReader;
 pub use crate::storage::RaftSnapshotBuilder;

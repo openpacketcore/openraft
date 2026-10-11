@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::core::raft_msg::external_command::ExternalCommand;
 use crate::error::CheckIsLeaderError;
+use crate::error::ForwardToLeader;
 use crate::error::Infallible;
 use crate::error::InitializeError;
 use crate::raft::AppendEntriesRequest;
@@ -23,6 +24,7 @@ use crate::MessageSummary;
 use crate::PeerResponseFence;
 use crate::PeerResponseFenceError;
 use crate::RaftTypeConfig;
+use crate::ReplicationReadback;
 use crate::Snapshot;
 use crate::Vote;
 
@@ -93,6 +95,10 @@ where C: RaftTypeConfig
 
     CheckIsLeaderRequest {
         tx: ClientReadTx<C>,
+    },
+
+    ReadReplication {
+        tx: ResultSender<C, ReplicationReadback<C>, ForwardToLeader<C::NodeId, C::Node>>,
     },
 
     Initialize {
@@ -167,6 +173,7 @@ where C: RaftTypeConfig
             }
             RaftMsg::ClientWriteRequest { .. } => "ClientWriteRequest".to_string(),
             RaftMsg::CheckIsLeaderRequest { .. } => "CheckIsLeaderRequest".to_string(),
+            RaftMsg::ReadReplication { .. } => "ReadReplication".to_string(),
             RaftMsg::Initialize { members, .. } => {
                 format!("Initialize: {:?}", members)
             }

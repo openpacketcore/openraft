@@ -111,6 +111,10 @@ pub(crate) struct ReplicationResult<C: RaftTypeConfig> {
 
     /// Ok for matching, Err for conflict.
     pub(crate) result: Result<Option<LogIdOf<C>>, LogIdOf<C>>,
+
+    /// Optional identity paired with this replication-stream append response.
+    /// Snapshot progress and metadata-free transports leave it absent.
+    pub(crate) runtime_id: Option<[u8; 16]>,
 }
 
 impl<C> fmt::Display for ReplicationResult<C>
@@ -132,7 +136,16 @@ impl<C> ReplicationResult<C>
 where C: RaftTypeConfig
 {
     pub(crate) fn new(sending_time: InstantOf<C>, result: Result<Option<LogIdOf<C>>, LogIdOf<C>>) -> Self {
-        Self { sending_time, result }
+        Self {
+            sending_time,
+            result,
+            runtime_id: None,
+        }
+    }
+
+    pub(crate) fn with_runtime_id(mut self, runtime_id: Option<[u8; 16]>) -> Self {
+        self.runtime_id = runtime_id;
+        self
     }
 }
 
