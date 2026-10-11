@@ -161,15 +161,12 @@ where C: RaftTypeConfig
         let Some(runtime_id) = result.runtime_id else {
             return;
         };
+        // Defensive: RaftCore::does_replication_session_match already enforces current membership.
         if target == &self.config.id || self.state.membership_state.effective().get_node(target).is_none() {
             return;
         }
-        match request_id {
-            RequestId::Snapshot { .. } => return,
-            RequestId::AppendEntries { .. } if !self.leader.progress.get(target).inflight.is_my_id(request_id) => {
-                return;
-            }
-            _ => {}
+        if matches!(request_id, RequestId::Snapshot { .. }) {
+            return;
         }
 
         // The same rule as LeaderHandler::get_read_log_id(), sampled before

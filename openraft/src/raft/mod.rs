@@ -1016,8 +1016,8 @@ where C: RaftTypeConfig
     /// Capture the local leader's accepted replication observations and Raft state.
     ///
     /// The capture is serialized with response acceptance, fencing, membership and
-    /// commit updates. A follower forwards to its current leader; a stopped engine
-    /// returns a fatal error. See [`crate::ReplicationReadback`] for the fresh
+    /// commit updates. A follower returns `ForwardToLeader` with its current hint;
+    /// a stopped engine returns a fatal error. See [`crate::ReplicationReadback`] for the fresh
     /// quorum round and same-leader check required after capture. This method does
     /// not send RPCs, wait for local apply, or establish a quorum proof itself.
     pub async fn replication_readback(

@@ -213,6 +213,14 @@ async fn participation_fence_hides_and_clears_prefix_but_retains_the_same_runtim
         Some(B),
         Ok(Some(log(9))),
     );
+    let delayed_after_release = append(
+        &core,
+        3,
+        RequestId::HeartBeat,
+        TestConfig::now(),
+        Some(B),
+        Ok(Some(log(9))),
+    );
     let receipt = fence(&mut core, 3).await;
     assert!(capture(&mut core).await.unwrap().observations.is_empty());
     core.handle_notify(delayed).unwrap();
@@ -220,6 +228,11 @@ async fn participation_fence_hides_and_clears_prefix_but_retains_the_same_runtim
     assert!(capture(&mut core).await.unwrap().observations.is_empty());
     release(&mut core, receipt).await;
     assert!(capture(&mut core).await.unwrap().observations.is_empty());
+    core.handle_notify(delayed_after_release).unwrap();
+    assert!(
+        capture(&mut core).await.unwrap().observations.is_empty(),
+        "a reply queued before the fence must stay hidden after release"
+    );
     core.engine.state.update_committed(&Some(log(8)));
     heartbeat(&mut core, A, TestConfig::now(), Some(log(2)));
     let read = capture(&mut core).await.unwrap();
@@ -310,6 +323,7 @@ async fn participation_stale_membership_and_transport_errors_do_not_refresh_a_ro
     core.engine.state.server_state = crate::ServerState::Leader;
     heartbeat(&mut core, A, TestConfig::now(), Some(log(5)));
     let before = capture(&mut core).await.unwrap().observations;
+    assert_eq!(before[&3].runtime_id, A);
     tokio::time::advance(Duration::from_millis(20)).await;
     let stale = append(
         &core,
@@ -445,6 +459,7 @@ async fn participation_ignored_observation_still_allows_ordinary_raft_commit_pro
         core.handle_notify(reply).unwrap();
     }
     let before = capture(&mut observed).await.unwrap().observations;
+    assert_eq!(before[&3].runtime_id, A);
     for (core, runtime_id) in [(&mut plain, None), (&mut observed, Some(B))] {
         let reply = append(
             core,
