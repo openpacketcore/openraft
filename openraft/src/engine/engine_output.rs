@@ -56,6 +56,7 @@ where C: RaftTypeConfig
             Command::RebuildReplicationStreams { .. } => {}
             Command::SaveVote { .. } => {}
             Command::SendVote { .. } => {}
+            Command::SendPreVote { .. } => {}
             Command::PurgeLog { .. } => {}
             Command::DeleteConflictLog { .. } => {}
             Command::Respond { .. } => {}
