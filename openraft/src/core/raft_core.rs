@@ -1835,7 +1835,9 @@ where
             );
 
             // Follower/Candidate timer: next election
-            if utime > Some(now - election_timeout) {
+            // A late ordinary campaign need not wait out a newer inquiry if
+            // the first inquiry in this unchanged context has already expired.
+            if utime > Some(now - election_timeout) && self.engine.pre_vote_fallback_term(now).is_none() {
                 tracing::debug!("election timeout has not yet passed",);
                 return;
             }

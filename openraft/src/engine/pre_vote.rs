@@ -22,6 +22,7 @@ pub(crate) struct PreVote<C: RaftTypeConfig> {
     pub(crate) started_at: InstantOf<C>,
     pub(crate) candidate: Candidate<C, LeaderQuorumSet<C::NodeId>>,
     deadline: InstantOf<C>,
+    fallback_deadline: InstantOf<C>,
     base_vote: Vote<C::NodeId>,
     vote_updated_at: Option<InstantOf<C>>,
     membership_log_id: Option<LogId<C::NodeId>>,
@@ -88,17 +89,14 @@ impl<C: RaftTypeConfig> Engine<C> {
         self.config.resample_election_timeout::<C::AsyncRuntime>();
         // A live legacy voter with a shorter log cannot win or answer PreVote.
         // After one bounded inquiry round, join its observed real election.
+        // Retries in the same election context do not renew that bound.
         // Silence alone never takes this path, so isolated upgraded voters
         // continue to inquire without consuming terms. No speculative grant
         // is converted into an actual vote, and the ordinary persistence and
         // joint-quorum rules below are unchanged.
-        if self.pre_vote.as_ref().is_some_and(|round| C::now() >= round.deadline)
-            && !self.pre_vote_lease_active(C::now())
-        {
-            if let Some(campaign) = &self.real_campaign {
-                self.elect_with_current_timeout_above(campaign.vote.leader_id().term);
-                return;
-            }
+        if let Some(term) = self.pre_vote_fallback_term(C::now()) {
+            self.elect_with_current_timeout_above(term);
+            return;
         }
         self.pre_vote_round = self.pre_vote_round.wrapping_add(1);
         self.candidate = None;
@@ -119,10 +117,13 @@ impl<C: RaftTypeConfig> Engine<C> {
         // This local grant is volatile too. A single voter still uses the same
         // persist-before-leadership path as every other real election.
         let quorum = candidate.grant_by(&self.config.id);
+        let deadline = now + self.config.timer_config.election_timeout;
+        let fallback_deadline = self.pre_vote.as_ref().map_or(deadline, |round| round.fallback_deadline);
         self.pre_vote = Some(PreVote {
             round: self.pre_vote_round,
             started_at: now,
-            deadline: now + self.config.timer_config.election_timeout,
+            deadline,
+            fallback_deadline,
             candidate,
             base_vote: self.state.vote_ref().clone(),
             vote_updated_at: self.state.vote_last_modified(),
@@ -149,20 +150,36 @@ impl<C: RaftTypeConfig> Engine<C> {
             && self.state.membership_state.effective().log_id() == &round.membership_log_id
     }
 
+    fn real_campaign_context_matches(&self, campaign: &RealCampaign<C>, now: InstantOf<C>) -> bool {
+        self.prepared_shutdown.is_none()
+            && self.leader.is_none()
+            && self.state.membership_state.effective().is_voter(&self.config.id)
+            && self.state.vote_ref() == &campaign.base_vote
+            && self.state.vote_last_modified() == campaign.vote_updated_at
+            && self.state.last_log_id() == campaign.last_log_id.as_ref()
+            && self.state.membership_state.effective().log_id() == &campaign.membership_log_id
+            && !self.pre_vote_lease_active(now)
+    }
+
+    /// An actual campaign can end the wait once the first inquiry has expired.
+    pub(crate) fn pre_vote_fallback_term(&self, now: InstantOf<C>) -> Option<u64> {
+        let round = self.pre_vote.as_ref()?;
+        let campaign = self.real_campaign.as_ref()?;
+        (now >= round.fallback_deadline
+            && self.pre_vote_context_matches(round)
+            && self.real_campaign_context_matches(campaign, now))
+        .then_some(campaign.vote.leader_id().term)
+    }
+
     pub(crate) fn discard_invalid_pre_vote(&mut self) {
         if self.pre_vote.as_ref().is_some_and(|round| !self.pre_vote_context_matches(round)) {
             self.pre_vote = None;
         }
-        if self.real_campaign.as_ref().is_some_and(|campaign| {
-            self.prepared_shutdown.is_some()
-                || self.leader.is_some()
-                || !self.state.membership_state.effective().is_voter(&self.config.id)
-                || self.state.vote_ref() != &campaign.base_vote
-                || self.state.vote_last_modified() != campaign.vote_updated_at
-                || self.state.last_log_id() != campaign.last_log_id.as_ref()
-                || self.state.membership_state.effective().log_id() != &campaign.membership_log_id
-                || self.pre_vote_lease_active(C::now())
-        }) {
+        if self
+            .real_campaign
+            .as_ref()
+            .is_some_and(|campaign| !self.real_campaign_context_matches(campaign, C::now()))
+        {
             self.real_campaign = None;
         }
     }
