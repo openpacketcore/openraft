@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use maplit::btreeset;
-use openraft::error::Unreachable;
+use openraft::error::NetworkError;
 use openraft::network::RPCTypes;
 use openraft::Config;
 use openraft::LogIdOptionExt;
@@ -59,7 +59,7 @@ async fn add_remove_voter() -> Result<()> {
             && ((to != 4 && !has_joint && request.entries.iter().any(|entry| entry.log_id.index >= joint_index))
                 || (to == 4 && request.entries.iter().any(|entry| entry.log_id.index > joint_index)))
         {
-            return Err(Unreachable::new(&std::io::Error::other("defer membership delivery")).into());
+            return Err(NetworkError::new(&std::io::Error::other("defer membership delivery")).into());
         }
         Ok(())
     });
