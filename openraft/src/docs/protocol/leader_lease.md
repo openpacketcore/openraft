@@ -62,17 +62,28 @@ Rolling upgrades and downgrades can leave a fresh upgraded voter beside a
 legacy voter whose log is shorter. The legacy voter cannot win that election
 or answer an inquiry, but it still sends ordinary vote requests. After refusing
 such a request, the upgraded voter remembers the actual candidate term only in
-memory. If its current inquiry round expires without a quorum, it starts an
-ordinary election above that observed term. This fallback requires an eligible
-voter's real, uncommitted request in the same vote, log and membership context,
-an expired leader lease, and a complete inquiry round. It still persists its
-self-vote and obtains both real majorities for a joint membership. A heartbeat,
+memory. The first inquiry deadline in the unchanged vote, log and membership
+context controls the fallback; retries do not renew it. Once that deadline has
+passed, a remembered campaign starts an ordinary election above the observed
+term at the next election tick. This requires an eligible voter's real,
+uncommitted request and an expired leader lease. It still persists its self-vote
+and obtains both real majorities for a joint membership. A heartbeat,
 vote, log or membership change, retirement, or a fence for the observed peer
 revokes this evidence. Silence or a failed inquiry alone does not enable the
-fallback, so an isolated upgraded voter continues to avoid term inflation.
+fallback, so a voter isolated before observing an eligible campaign continues
+inquiries without inflating its term.
 No operator activation or binary-version inference is required. Transport
 adapters must continue to reject unsupported inquiries without translating them
 into vote requests.
+
+A voter that refuses a genuine campaign and then loses contact may consume one
+term through this fallback. If another candidate becomes leader during that
+gap, the returning voter's persisted higher vote can depose that leader once.
+Starting the fallback clears the remembered campaign and changes the vote
+context, so this cost is bounded to one term per election context. The window
+also exists after a genuine election in an all-upgraded cluster and can add one
+leader change plus a lease and election-timeout wait. It has no safety impact:
+the ordinary persisted-vote and real-quorum rules still apply.
 
 Election deadlines are evaluated at intervals of at most 100 ms, independently
 of the heartbeat period. Heartbeat emission retains its own configured deadline.
