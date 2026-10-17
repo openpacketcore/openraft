@@ -2001,6 +2001,8 @@ where
                 self.remove_all_replication();
                 self.drain_retired_replications().await?;
                 self.leader_data = None;
+                // Retry purges that were blocked by the former leader's readers.
+                self.engine.try_purge_log();
             }
             Command::AppendInputEntries { vote, entries } => {
                 let last_log_id = entries.last().unwrap().get_log_id().clone();

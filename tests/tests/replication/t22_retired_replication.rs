@@ -1832,6 +1832,129 @@ async fn retired_snapshot(fixture: &Fixture) -> Result<Arc<SnapshotGate>> {
     Ok(gate)
 }
 
+async fn stepdown_pending_purge(fail_reader: bool) -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = async {
+        let child = active_snapshot(&fixture, false).await?;
+        child.storage_error_on_release.store(fail_reader, Ordering::SeqCst);
+        let initial_purge = fixture.store.clone().get_log_state().await?.last_purged_log_id;
+        let initial_operations = fixture.probe.operations().len();
+        let target = fixture.write(1).await?;
+        let snapshot = fixture.snapshot().await?;
+        anyhow::ensure!(snapshot.meta.last_log_id == Some(target) && Some(target) > initial_purge);
+        let suffix = fixture.write(2).await?;
+        let initial_log_ids = within(
+            fixture.raft.with_raft_state(|state| state.log_ids.clone()),
+            "STEPDOWN_PURGE_SETUP: observe retained engine log ids",
+        )
+        .await??;
+        within(
+            fixture.raft.trigger().purge_log(target.index),
+            "STEPDOWN_PURGE_SETUP: schedule eligible prefix behind active snapshot",
+        )
+        .await??;
+        let pending_log_ids = within(
+            fixture.raft.with_raft_state(|state| state.log_ids.clone()),
+            "STEPDOWN_PURGE_SETUP: observe pending engine purge",
+        )
+        .await??;
+        // Issuing Command::PurgeLog advances the engine's log-id frontier before
+        // physical storage runs. These unchanged ids prove the active transfer
+        // blocked the purge in the engine, not only in the core command queue.
+        anyhow::ensure!(
+            pending_log_ids == initial_log_ids,
+            "STEPDOWN_PURGE_SETUP: engine already issued the purge"
+        );
+        anyhow::ensure!(fixture.probe.operations().len() == initial_operations);
+        anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_purged_log_id == initial_purge);
+
+        let vote = Vote::new_committed(fixture.raft.metrics().borrow().current_term + 1, 1);
+        let mut demote = std::pin::pin!(fixture.raft.append_entries(AppendEntriesRequest {
+            vote,
+            prev_log_id: Some(suffix),
+            entries: vec![],
+            leader_commit: Some(suffix),
+        }));
+        anyhow::ensure!(futures::poll!(&mut demote).is_pending());
+        observed(
+            &child.cancelled,
+            "STEPDOWN_PURGE_SETUP: stepdown did not cancel snapshot transfer",
+        )
+        .await?;
+        anyhow::ensure!(
+            tokio::time::timeout(HELD, &mut demote).await.is_err(),
+            "STEPDOWN_PURGE_OWNERSHIP: stepdown completed while snapshot data was still owned"
+        );
+        anyhow::ensure!(!*child.dropped.borrow());
+        anyhow::ensure!(fixture.probe.operations().len() == initial_operations);
+        anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_purged_log_id == initial_purge);
+        anyhow::ensure!(fixture.store.clone().read_vote().await? == Some(vote));
+
+        child.release.close();
+        // Ticks and heartbeats are disabled. Only observe the already submitted
+        // demotion and storage/metrics after release: no write, snapshot or purge
+        // request may supply a second chance to retry the pending frontier.
+        let response = within(&mut demote, "STEPDOWN_PURGE_JOIN: snapshot reader did not drain").await?;
+        observed(
+            &child.dropped,
+            "STEPDOWN_PURGE_JOIN: snapshot data survived reader drain",
+        )
+        .await?;
+        anyhow::ensure!(fixture.probe.live_readers.lock().unwrap().is_empty());
+        if fail_reader {
+            let error = returned_snapshot_storage_error(&child, "STEPDOWN_PURGE_FAILURE: missing reader error").await?;
+            anyhow::ensure!(
+                matches!(response, Err(RaftError::Fatal(Fatal::StorageError(ref actual))) if actual == &error),
+                "STEPDOWN_PURGE_FAILURE: demotion lost the reader's exact storage error: {response:?}"
+            );
+            fatal_seen(&fixture.raft, &Fatal::StorageError(error)).await?;
+            anyhow::ensure!(fixture.probe.operations().len() == initial_operations);
+            anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_purged_log_id == initial_purge);
+        } else {
+            anyhow::ensure!(response?.is_success());
+            within(
+                fixture.raft.wait(None).purged(Some(target), "stepdown retried pending purge"),
+                "STEPDOWN_PURGE_IDLE: drained readers left the eligible prefix pending",
+            )
+            .await??;
+            let state = fixture.store.clone().get_log_state().await?;
+            anyhow::ensure!(state.last_purged_log_id == Some(target) && state.last_log_id == Some(suffix));
+            let entries = fixture.store.clone().try_get_log_entries(0..).await?;
+            anyhow::ensure!(entries.len() == 1 && entries[0].log_id == suffix);
+            anyhow::ensure!(matches!(&entries[0].payload, EntryPayload::Normal(request)
+                if request.client == "retirement" && request.serial == 2 && request.status == "request-2"));
+            let operations = fixture.probe.operations();
+            anyhow::ensure!(
+                operations.len() == initial_operations + 1
+                    && operations.last().unwrap().operation == "purge"
+                    && operations.last().unwrap().log_id == Some(target)
+            );
+            let metrics = fixture.raft.metrics().borrow().clone();
+            anyhow::ensure!(
+                metrics.running_state.is_ok()
+                    && metrics.state == ServerState::Follower
+                    && metrics.snapshot == Some(target)
+                    && metrics.last_applied == Some(suffix)
+            );
+        }
+        fixture.probe.assert_no_overlap()
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn stepdown_pending_purge_waits_for_snapshot_reader() -> Result<()> {
+    stepdown_pending_purge(false).await
+}
+
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn stepdown_pending_purge_preserves_snapshot_reader_failure() -> Result<()> {
+    stepdown_pending_purge(true).await
+}
+
 #[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
 async fn shutdown_waits_for_retired_snapshot_child_after_cancellation() -> Result<()> {
     let fixture = Fixture::new().await?;
