@@ -21,6 +21,7 @@ use crate::engine::handler::snapshot_handler::SnapshotHandler;
 use crate::engine::handler::vote_handler::VoteHandler;
 use crate::engine::leadership_transfer::PreparedShutdown;
 use crate::engine::pre_vote::PreVote;
+use crate::engine::pre_vote::RealCampaign;
 use crate::engine::Command;
 use crate::engine::EngineOutput;
 use crate::engine::Respond;
@@ -96,6 +97,9 @@ where C: RaftTypeConfig
     pub(crate) pre_vote: Option<PreVote<C>>,
     pub(crate) pre_vote_round: u64,
 
+    /// A real campaign observed in the current election context, for rolling compatibility.
+    pub(crate) real_campaign: Option<RealCampaign<C>>,
+
     /// Retirement is irreversible for this engine instance, including after a new vote.
     pub(crate) prepared_shutdown: Option<PreparedShutdown<C::NodeId>>,
 
@@ -118,6 +122,7 @@ where C: RaftTypeConfig
             candidate: None,
             pre_vote: None,
             pre_vote_round: 0,
+            real_campaign: None,
             prepared_shutdown: None,
             output: EngineOutput::new(4096),
         }
@@ -239,10 +244,16 @@ where C: RaftTypeConfig
 
     /// Begin the real election after a pre-vote quorum, without sampling twice.
     pub(super) fn elect_with_current_timeout(&mut self) {
+        self.elect_with_current_timeout_above(self.state.vote_ref().leader_id().term);
+    }
+
+    /// A compatibility campaign may have learned a higher *actual* candidate term.
+    pub(super) fn elect_with_current_timeout_above(&mut self, observed_term: u64) {
         if self.prepared_shutdown.is_some() {
             return;
         }
         self.pre_vote = None;
+        self.real_campaign = None;
         // Leadership must be relinquished before campaigning: a Leader that campaigns keeps
         // `leader.vote` at the old term while `state.vote` moves to the new one, which breaks the
         // invariant `LeaderHandler` relies on.
@@ -252,7 +263,7 @@ where C: RaftTypeConfig
             self.leader.as_ref().map(|l| l.vote.to_string()).unwrap_or_default()
         );
 
-        let new_term = self.state.vote.leader_id().term + 1;
+        let new_term = self.state.vote.leader_id().term.max(observed_term) + 1;
         let new_vote = Vote::new(new_term, self.config.id.clone());
 
         let candidate = self.new_candidate(new_vote.clone());
@@ -349,6 +360,7 @@ where C: RaftTypeConfig
         if req.last_log_id.as_ref() >= self.state.last_log_id() {
             // Ok
         } else {
+            self.remember_real_campaign(&req);
             tracing::info!(
                 "reject vote-request: by last_log_id: !(req.last_log_id({}) >= my_last_log_id({})",
                 req.last_log_id.summary(),

@@ -281,3 +281,153 @@ async fn single_voter_still_persists_its_real_vote_before_leadership() {
     engine.handle_vote_resp(0, VoteResponse::new(Vote::new(6, 0), None, true));
     assert!(engine.leader.is_some());
 }
+
+fn stale_real_request(vote: Vote<u64>) -> VoteRequest<u64> {
+    VoteRequest::new(vote, Some(log_id(5, 2, 2)))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_real_campaign_allows_one_bounded_inquiry_then_durable_ordinary_voting() {
+    let mut engine = engine(0);
+    let before = engine.state.clone();
+    let response = engine.handle_vote_req(stale_real_request(Vote::new(100, 1)));
+    assert!(!response.vote_granted);
+    assert_eq!(before, engine.state);
+    assert!(engine.output.take_commands().is_empty());
+    assert!(engine.real_campaign.is_some());
+    begin(&mut engine);
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    begin(&mut engine);
+    assert_eq!(before, engine.state, "an unexpired round cannot fall back");
+    tokio::time::advance(Duration::from_millis(100)).await;
+    engine.pre_elect();
+    let actual = Vote::new(101, 0);
+    assert_eq!(actual, *engine.state.vote_ref());
+    assert!(engine.pre_vote.is_none());
+    assert!(engine.real_campaign.is_none());
+    assert!(engine.leader.is_none());
+    assert_eq!(0, engine.candidate.as_ref().unwrap().granters().count());
+    assert_eq!(engine.output.take_commands(), vec![
+        Command::SaveVote { vote: actual },
+        Command::SendVote {
+            vote_req: VoteRequest::new(actual, Some(log_id(5, 2, 3))),
+        }
+    ]);
+    engine.handle_vote_resp(0, VoteResponse::new(actual, None, true));
+    assert!(engine.leader.is_none());
+    engine.handle_vote_resp(1, VoteResponse::new(actual, Some(log_id(5, 2, 2)), true));
+    assert!(engine.leader.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn nonmember_self_committed_and_stale_requests_do_not_enable_fallback() {
+    for vote in [
+        Vote::new(100, 9),
+        Vote::new(100, 0),
+        Vote::new_committed(100, 1),
+        Vote::new(4, 1),
+    ] {
+        let mut engine = engine(0);
+        let before = engine.state.clone();
+        assert!(!engine.handle_vote_req(stale_real_request(vote)).vote_granted);
+        assert!(engine.real_campaign.is_none());
+        for _ in 0..4 {
+            begin(&mut engine);
+            tokio::time::advance(Duration::from_millis(101)).await;
+        }
+        assert_eq!(before, engine.state);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn election_context_changes_and_peer_fences_revoke_real_campaign_evidence() {
+    for change in 0..6 {
+        let mut engine = engine(0);
+        assert!(!engine.handle_vote_req(stale_real_request(Vote::new(100, 1))).vote_granted);
+        begin(&mut engine);
+        tokio::time::advance(Duration::from_millis(101)).await;
+        match change {
+            0 => engine.state.vote.touch(TokioInstant::now()),
+            1 => engine.state.vote.update(TokioInstant::now(), Vote::new(6, 1)),
+            2 => engine.state.log_ids = LogIdList::new([log_id(5, 2, 4)]),
+            3 => engine.state.membership_state.set_effective(Arc::new(EffectiveMembership::new(
+                Some(log_id(5, 2, 3)),
+                Membership::new(vec![btreeset! {0, 1, 2}], None),
+            ))),
+            4 => {
+                assert!(engine.prepare_shutdown(None).unwrap().is_none());
+            }
+            5 => {
+                engine.revoke_pre_vote_evidence(&2);
+                assert!(
+                    engine.real_campaign.is_some(),
+                    "an unrelated peer does not own this evidence"
+                );
+                engine.revoke_pre_vote_evidence(&1);
+            }
+            _ => unreachable!(),
+        }
+        let before = engine.state.clone();
+        engine.output.take_commands();
+        engine.discard_invalid_pre_vote();
+        assert!(engine.real_campaign.is_none(), "changed context {change}");
+        engine.pre_elect();
+        assert_eq!(before, engine.state);
+        assert!(engine.leader.is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn compatibility_fallback_still_requires_both_real_joint_majorities() {
+    let mut engine = engine(0);
+    engine.state.membership_state.set_effective(Arc::new(EffectiveMembership::new(
+        Some(log_id(4, 2, 1)),
+        Membership::new(vec![btreeset! {0, 1, 2}, btreeset! {0, 3, 4}], None),
+    )));
+    assert!(!engine.handle_vote_req(stale_real_request(Vote::new(100, 1))).vote_granted);
+    begin(&mut engine);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    engine.pre_elect();
+    let actual = Vote::new(101, 0);
+    assert_eq!(actual, *engine.state.vote_ref());
+    assert!(matches!(engine.output.take_commands().as_slice(), [
+        Command::SaveVote { .. },
+        Command::SendVote { .. }
+    ]));
+    for id in [0, 1, 2] {
+        engine.handle_vote_resp(id, VoteResponse::new(actual, None, true));
+    }
+    assert!(engine.leader.is_none());
+    engine.handle_vote_resp(3, VoteResponse::new(actual, None, true));
+    assert!(engine.leader.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_leases_and_nonvoters_do_not_remember_ordinary_campaigns() {
+    for case in 0..4 {
+        let mut engine = engine(0);
+        match case {
+            0 => engine.state.vote.touch(TokioInstant::now()),
+            1 => {
+                engine.state.server_state = ServerState::Leader;
+                let leader = engine.testing_new_leader();
+                let _ = leader.clock_progress.increase_to(&1, Some(TokioInstant::now()));
+            }
+            2 => engine.state.membership_state.set_effective(Arc::new(EffectiveMembership::new(
+                Some(log_id(4, 2, 1)),
+                Membership::new(vec![btreeset! {1, 2}], None),
+            ))),
+            3 => {
+                assert!(engine.prepare_shutdown(None).unwrap().is_none());
+            }
+            _ => unreachable!(),
+        }
+        let before = engine.state.clone();
+        engine.output.take_commands();
+        assert!(!engine.handle_vote_req(stale_real_request(Vote::new(100, 1))).vote_granted);
+        assert!(engine.real_campaign.is_none());
+        assert_eq!(before, engine.state);
+        assert!(engine.output.take_commands().is_empty());
+    }
+}

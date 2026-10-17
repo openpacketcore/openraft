@@ -1320,9 +1320,7 @@ where
 
     /// Start a fresh response generation without changing any quorum or commit.
     fn reset_peer_response_evidence(&mut self, peer: &C::NodeId) {
-        if let Some(round) = &mut self.engine.pre_vote {
-            round.candidate.revoke_grant(peer);
-        }
+        self.engine.revoke_pre_vote_evidence(peer);
         if let Some(candidate) = &mut self.engine.candidate {
             candidate.revoke_grant(peer);
         }

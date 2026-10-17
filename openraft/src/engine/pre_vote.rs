@@ -8,6 +8,7 @@ use crate::proposer::LeaderQuorumSet;
 use crate::quorum::QuorumSet;
 use crate::raft::PreVoteRequest;
 use crate::raft::PreVoteResponse;
+use crate::raft::VoteRequest;
 use crate::raft_state::LogStateReader;
 use crate::type_config::alias::InstantOf;
 use crate::type_config::TypeConfigExt;
@@ -23,6 +24,17 @@ pub(crate) struct PreVote<C: RaftTypeConfig> {
     deadline: InstantOf<C>,
     base_vote: Vote<C::NodeId>,
     vote_updated_at: Option<InstantOf<C>>,
+    membership_log_id: Option<LogId<C::NodeId>>,
+}
+
+/// Evidence of an ordinary campaign, not an inferred capability or a grant.
+/// A legacy voter cannot answer an inquiry, but it does still send real votes.
+#[derive(Debug)]
+pub(crate) struct RealCampaign<C: RaftTypeConfig> {
+    vote: Vote<C::NodeId>,
+    base_vote: Vote<C::NodeId>,
+    vote_updated_at: Option<InstantOf<C>>,
+    last_log_id: Option<LogId<C::NodeId>>,
     membership_log_id: Option<LogId<C::NodeId>>,
 }
 
@@ -65,6 +77,7 @@ impl<C: RaftTypeConfig> Engine<C> {
 
     /// Start one inquiry round. Real votes are still persisted by the ordinary election path.
     pub(crate) fn pre_elect(&mut self) {
+        self.discard_invalid_pre_vote();
         if self.prepared_shutdown.is_some()
             || self.leader.is_some()
             || !self.state.membership_state.effective().is_voter(&self.config.id)
@@ -73,6 +86,20 @@ impl<C: RaftTypeConfig> Engine<C> {
         }
 
         self.config.resample_election_timeout::<C::AsyncRuntime>();
+        // A live legacy voter with a shorter log cannot win or answer PreVote.
+        // After one bounded inquiry round, join its observed real election.
+        // Silence alone never takes this path, so isolated upgraded voters
+        // continue to inquire without consuming terms. No speculative grant
+        // is converted into an actual vote, and the ordinary persistence and
+        // joint-quorum rules below are unchanged.
+        if self.pre_vote.as_ref().is_some_and(|round| C::now() >= round.deadline)
+            && !self.pre_vote_lease_active(C::now())
+        {
+            if let Some(campaign) = &self.real_campaign {
+                self.elect_with_current_timeout_above(campaign.vote.leader_id().term);
+                return;
+            }
+        }
         self.pre_vote_round = self.pre_vote_round.wrapping_add(1);
         self.candidate = None;
 
@@ -125,6 +152,68 @@ impl<C: RaftTypeConfig> Engine<C> {
     pub(crate) fn discard_invalid_pre_vote(&mut self) {
         if self.pre_vote.as_ref().is_some_and(|round| !self.pre_vote_context_matches(round)) {
             self.pre_vote = None;
+        }
+        if self.real_campaign.as_ref().is_some_and(|campaign| {
+            self.prepared_shutdown.is_some()
+                || self.leader.is_some()
+                || !self.state.membership_state.effective().is_voter(&self.config.id)
+                || self.state.vote_ref() != &campaign.base_vote
+                || self.state.vote_last_modified() != campaign.vote_updated_at
+                || self.state.last_log_id() != campaign.last_log_id.as_ref()
+                || self.state.membership_state.effective().log_id() != &campaign.membership_log_id
+                || self.pre_vote_lease_active(C::now())
+        }) {
+            self.real_campaign = None;
+        }
+    }
+
+    /// Remember only an eligible real request refused for its shorter log.
+    /// This changes no vote, timestamp, timer, log, grant or persistent state.
+    pub(super) fn remember_real_campaign(&mut self, request: &VoteRequest<C::NodeId>) {
+        self.discard_invalid_pre_vote();
+        let membership = self.state.membership_state.effective();
+        let Some(candidate) = request.vote.leader_id().voted_for() else {
+            return;
+        };
+        if self.prepared_shutdown.is_some()
+            || self.leader.is_some()
+            || !membership.is_voter(&self.config.id)
+            || !membership.is_voter(&candidate)
+            || candidate == self.config.id
+            || request.vote.is_committed()
+            || &request.vote <= self.state.vote_ref()
+            || request.last_log_id.as_ref() >= self.state.last_log_id()
+            || self.pre_vote_lease_active(C::now())
+        {
+            return;
+        }
+        if self
+            .real_campaign
+            .as_ref()
+            .is_some_and(|known| known.vote.leader_id().term > request.vote.leader_id().term)
+        {
+            return;
+        }
+        self.real_campaign = Some(RealCampaign {
+            vote: request.vote.clone(),
+            base_vote: self.state.vote_ref().clone(),
+            vote_updated_at: self.state.vote_last_modified(),
+            last_log_id: self.state.last_log_id().cloned(),
+            membership_log_id: membership.log_id().clone(),
+        });
+    }
+
+    /// A new authenticated peer generation revokes its previous election evidence.
+    pub(crate) fn revoke_pre_vote_evidence(&mut self, peer: &C::NodeId) {
+        if let Some(round) = &mut self.pre_vote {
+            round.candidate.revoke_grant(peer);
+        }
+        if self
+            .real_campaign
+            .as_ref()
+            .is_some_and(|campaign| campaign.vote.leader_id().voted_for().as_ref() == Some(peer))
+        {
+            self.real_campaign = None;
         }
     }
 

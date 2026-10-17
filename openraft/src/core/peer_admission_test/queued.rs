@@ -37,6 +37,26 @@ use crate::StorageIOError;
 type Core = RaftCore<TestConfig, Network, MemoryStore, MemoryStore>;
 
 #[tokio::test(start_paused = true)]
+async fn a_fence_revokes_the_ordinary_campaign_that_could_enable_pre_vote_fallback() {
+    let mut core = core(&[1, 2, 3], false);
+    core.engine.handle_vote_req(VoteRequest::new(Vote::new(100, 2), Some(log(9))));
+    assert!(core.engine.real_campaign.is_some());
+    core.engine.pre_elect();
+    let before = core.engine.state.clone();
+    core.engine.output.take_commands();
+    let receipt = fence(&mut core, 2).await;
+    assert!(core.engine.real_campaign.is_none());
+    release(&mut core, receipt).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    core.engine.pre_elect();
+    assert_eq!(before, core.engine.state);
+    assert!(core.engine.real_campaign.is_none());
+    assert!(matches!(core.engine.output.take_commands().as_slice(), [
+        crate::engine::Command::SendPreVote { .. }
+    ]));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_fence_rejects_queued_pre_vote_grants_and_higher_actual_terms() {
     for higher in [false, true] {
         let mut core = core(&[1, 2, 3], false);

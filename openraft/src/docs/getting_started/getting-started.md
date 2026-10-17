@@ -196,7 +196,11 @@ Pre-Vote is a read-only inquiry before an ordinary election. Authenticate it as
 voting traffic, but give it a distinct endpoint or wire family: forwarding a
 pre-vote to `vote()` would incorrectly persist the proposed future term. A
 receiver that does not support Pre-Vote must reject it; do not fall back to the
-real Vote RPC. The examples provide a separate Pre-Vote endpoint.
+real Vote RPC. The examples provide a separate Pre-Vote endpoint. The engine
+handles rolling compatibility itself: an observed eligible ordinary campaign
+can start a real election after one bounded inquiry round, with all real-vote
+persistence and quorum checks retained. A transport failure alone is not a
+capability signal or a vote grant.
 
 [Mem KV Network](https://github.com/datafuselabs/openraft/blob/main/examples/raft-kv-memstore/src/network/raft_network_impl.rs)
 demonstrates how to forward messages to other Raft nodes using [`reqwest`](https://docs.rs/reqwest/latest/reqwest/) as network transport layer.

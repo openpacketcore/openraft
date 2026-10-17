@@ -58,6 +58,22 @@ retirement, or a peer-response fence. Joint membership still requires both
 majorities. Bootstrap and an authenticated exact-vote planned handoff retain
 their ordinary persisted election path.
 
+Rolling upgrades and downgrades can leave a fresh upgraded voter beside a
+legacy voter whose log is shorter. The legacy voter cannot win that election
+or answer an inquiry, but it still sends ordinary vote requests. After refusing
+such a request, the upgraded voter remembers the actual candidate term only in
+memory. If its current inquiry round expires without a quorum, it starts an
+ordinary election above that observed term. This fallback requires an eligible
+voter's real, uncommitted request in the same vote, log and membership context,
+an expired leader lease, and a complete inquiry round. It still persists its
+self-vote and obtains both real majorities for a joint membership. A heartbeat,
+vote, log or membership change, retirement, or a fence for the observed peer
+revokes this evidence. Silence or a failed inquiry alone does not enable the
+fallback, so an isolated upgraded voter continues to avoid term inflation.
+No operator activation or binary-version inference is required. Transport
+adapters must continue to reject unsupported inquiries without translating them
+into vote requests.
+
 Election deadlines are evaluated at intervals of at most 100 ms, independently
 of the heartbeat period. Heartbeat emission retains its own configured deadline.
 These timers govern liveness; Pre-Vote adds no clock-based safety decision and
