@@ -269,9 +269,12 @@ async fn fresh_upgraded_survivor_can_elect_with_a_stale_legacy_survivor() -> any
     assert_eq!(fresh.client_status["acknowledged-before-loss"], "must-survive");
     assert!(!stale.client_status.contains_key("acknowledged-before-loss"));
 
+    let lost_at = Instant::now();
     let stopped = state.nodes.lock().unwrap().remove(&0).unwrap();
     stopped.shutdown().await;
-    let deadline = Instant::now() + Duration::from_secs(26);
+    state.legacy_campaigns.store(0, Ordering::SeqCst);
+    state.new_campaigns.store(0, Ordering::SeqCst);
+    let deadline = lost_at + Duration::from_secs(26);
     let recovered = tokio::time::timeout_at(deadline, async {
         current
             .wait(Some(Duration::from_secs(26)))
@@ -300,7 +303,11 @@ async fn fresh_upgraded_survivor_can_elect_with_a_stale_legacy_survivor() -> any
         endpoint.shutdown().await;
     }
     assert!(legacy_campaigns > 0, "the actual previous fork sent ordinary votes");
-    assert!(recovered.is_ok(), "live mixed quorum failed to recover: legacy votes={legacy_campaigns}, upgraded votes={new_campaigns}, unsupported inquiries={unsupported}");
+    assert!(
+        unsupported > 0,
+        "the upgraded voter encountered a genuinely unsupported inquiry"
+    );
+    assert!(recovered.as_ref().is_ok_and(|result| result.is_ok()), "live mixed quorum failed to recover: legacy votes={legacy_campaigns}, upgraded votes={new_campaigns}, unsupported inquiries={unsupported}");
     recovered.unwrap()?;
     assert!(new_campaigns > 0, "the fresh voter must obtain real votes");
     for machine in [
