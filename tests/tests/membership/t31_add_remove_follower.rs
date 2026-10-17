@@ -118,10 +118,10 @@ async fn add_remove_voter() -> Result<()> {
     }
 
     // Keep the existing two-second bound. It exceeds the maximum lease,
-    // election wait and first inquiry deadline, including both tick margins.
+    // election wait, inquiry deadline and newer-log backoff, plus tick margins.
     // Heartbeats keep the retained quorum healthy but no longer reach node 4.
     let observation = timeout().unwrap();
-    assert!(observation > Duration::from_millis(3 * config.election_timeout_max + 3 * config.heartbeat_interval));
+    assert!(observation > Duration::from_millis(5 * config.election_timeout_max + 3 * config.heartbeat_interval));
     let until = tokio::time::Instant::now() + observation;
     loop {
         let removed_metrics = removed.metrics().borrow().clone();
