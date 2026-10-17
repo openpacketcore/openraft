@@ -44,5 +44,7 @@ tracing-subscriber = { workspace = true }
 [features]
 
 bt = ["openraft/bt"]
+serde = ["openraft/serde"]
+storage-v2 = ["openraft/storage-v2", "openraft-memstore/storage-v2"]
 single-term-leader = ["openraft/single-term-leader", "legacy-openraft/single-term-leader"]
 loosen-follower-log-revert = ["openraft/loosen-follower-log-revert"]

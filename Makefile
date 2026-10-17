@@ -13,8 +13,16 @@ test:
 	cargo test --features bt
 	cargo test --features serde
 	cargo test --features single-term-leader
+	$(MAKE) test_storage_v2
 	cargo test --manifest-path examples/raft-kv-memstore/Cargo.toml
 	cargo test --manifest-path examples/raft-kv-rocksdb/Cargo.toml
+
+# Keep the engine, fixture contract, and integration suite on the SDK feature set.
+# Other workspace stores still use the legacy storage API.
+test_storage_v2:
+	cargo test --manifest-path openraft/Cargo.toml --features serde,storage-v2,single-term-leader
+	cargo test --manifest-path memstore/Cargo.toml --features storage-v2,openraft/single-term-leader
+	cargo test --manifest-path tests/Cargo.toml --features serde,storage-v2,single-term-leader
 
 bench:
 	cargo bench --features bench
@@ -76,4 +84,4 @@ typos:
 clean:
 	cargo clean
 
-.PHONY: test fmt lint clean doc guide
+.PHONY: test test_storage_v2 fmt lint clean doc guide

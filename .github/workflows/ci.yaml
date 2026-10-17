@@ -164,6 +164,11 @@ jobs:
             send_delay: "0"
             features: "single-term-leader"
 
+          # SDK consumers use the v2 storage API and standard Raft terms.
+          - toolchain: "nightly"
+            send_delay: "0"
+            features: "serde,storage-v2,single-term-leader"
+
 
     steps:
       - name: Setup | Checkout
@@ -227,8 +232,13 @@ jobs:
       matrix:
         include:
           - store: "memstore"
+            features: ""
+          - store: "memstore"
+            features: "storage-v2,openraft/single-term-leader"
           - store: "rocksstore"
+            features: ""
           - store: "sledstore"
+            features: ""
 
     steps:
       - name: Setup | Checkout
@@ -249,7 +259,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --manifest-path "${{ matrix.store }}/Cargo.toml"
+          args: --manifest-path "${{ matrix.store }}/Cargo.toml" --features "${{ matrix.features }}"
         env:
           # Parallel tests block each other and result in timeout.
           RUST_TEST_THREADS: 2

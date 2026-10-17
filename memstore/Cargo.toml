@@ -25,6 +25,7 @@ tracing         = { workspace = true }
 
 [features]
 bt = ["openraft/bt"]
+storage-v2 = ["openraft/storage-v2"]
 
 [package.metadata.docs.rs]
 all-features = true
