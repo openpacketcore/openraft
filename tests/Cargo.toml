@@ -20,6 +20,9 @@ repository    = { workspace = true }
 [dev-dependencies]
 openraft           = { path="../openraft", version = "0.9.0" }
 openraft-memstore  = { path="../memstore" }
+# The previous protocol is executed in the rolling-election regression.
+legacy-openraft = { package = "openraft", git = "https://github.com/openpacketcore/openraft", rev = "0be191c797fd8fab603474864ac8ba8211206dc2", features = ["serde"] }
+legacy-memstore = { package = "openraft-memstore", git = "https://github.com/openpacketcore/openraft", rev = "0be191c797fd8fab603474864ac8ba8211206dc2" }
 
 anyerror           = { workspace = true }
 anyhow             = { workspace = true }
@@ -30,6 +33,8 @@ lazy_static        = { workspace = true }
 maplit             = { workspace = true }
 pretty_assertions  = { workspace = true }
 rand               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 tokio              = { workspace = true, features = ["test-util"] }
 tracing            = { workspace = true }
 tracing-appender   = { workspace = true }
@@ -39,5 +44,5 @@ tracing-subscriber = { workspace = true }
 [features]
 
 bt = ["openraft/bt"]
-single-term-leader = ["openraft/single-term-leader"]
+single-term-leader = ["openraft/single-term-leader", "legacy-openraft/single-term-leader"]
 loosen-follower-log-revert = ["openraft/loosen-follower-log-revert"]
