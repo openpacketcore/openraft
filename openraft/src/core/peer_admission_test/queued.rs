@@ -179,6 +179,42 @@ async fn unanswered_pre_vote_retries_use_their_own_deadline_without_inflating_te
     assert_eq!(before, core.engine.state);
 }
 
+#[tokio::test(start_paused = true)]
+async fn pre_vote_fallback_deadline_allows_the_next_tick_after_a_late_real_campaign() {
+    let mut core = core(&[1, 2, 3], false);
+    core.runtime_config.enable_elect.store(true, Ordering::Relaxed);
+    core.engine.config.election_timeout_min = 100;
+    core.engine.config.election_timeout_max = 101;
+    core.engine.config.timer_config.election_timeout = Duration::from_millis(100);
+    let before = core.engine.state.clone();
+
+    for i in 1..=2 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        core.handle_notify(Notify::Tick { i }).unwrap();
+        assert!(matches!(core.engine.output.take_commands().as_slice(), [
+            crate::engine::Command::SendPreVote { .. }
+        ]));
+        assert_eq!(before, core.engine.state, "silence does not start a real election");
+    }
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(!core.engine.handle_vote_req(VoteRequest::new(Vote::new(100, 2), Some(log(9)))).vote_granted);
+    assert_eq!(before, core.engine.state, "a stale real request grants no vote");
+    assert!(core.engine.output.take_commands().is_empty());
+    core.handle_notify(Notify::Tick { i: 3 }).unwrap();
+
+    let actual = Vote::new(101, 1);
+    assert_eq!(actual, *core.engine.state.vote_ref());
+    assert!(core.engine.leader.is_none());
+    assert_eq!(0, core.engine.candidate.as_ref().unwrap().granters().count());
+    assert_eq!(core.engine.output.take_commands(), vec![
+        crate::engine::Command::SaveVote { vote: actual },
+        crate::engine::Command::SendVote {
+            vote_req: VoteRequest::new(actual, Some(log(10))),
+        }
+    ]);
+}
+
 #[tokio::test]
 async fn resign_commands_recheck_the_current_sender_response_fence() {
     let mut core = core(&[1, 2, 3], false);

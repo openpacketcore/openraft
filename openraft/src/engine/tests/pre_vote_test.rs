@@ -287,6 +287,34 @@ fn stale_real_request(vote: Vote<u64>) -> VoteRequest<u64> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn pre_vote_fallback_deadline_survives_retries_before_a_real_campaign_arrives() {
+    for retry_after_ms in [99, 100] {
+        let mut engine = engine(0);
+        let before = engine.state.clone();
+        begin(&mut engine);
+        tokio::time::advance(Duration::from_millis(retry_after_ms)).await;
+        begin(&mut engine);
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert!(!engine.handle_vote_req(stale_real_request(Vote::new(100, 1))).vote_granted);
+        assert_eq!(before, engine.state, "a stale real request grants no vote");
+        assert!(engine.output.take_commands().is_empty());
+        engine.pre_elect();
+
+        let actual = Vote::new(101, 0);
+        assert_eq!(actual, *engine.state.vote_ref(), "one inquiry timeout bounds fallback");
+        assert!(engine.leader.is_none());
+        assert_eq!(0, engine.candidate.as_ref().unwrap().granters().count());
+        assert_eq!(engine.output.take_commands(), vec![
+            Command::SaveVote { vote: actual },
+            Command::SendVote {
+                vote_req: VoteRequest::new(actual, Some(log_id(5, 2, 3))),
+            }
+        ]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_real_campaign_allows_one_bounded_inquiry_then_durable_ordinary_voting() {
     let mut engine = engine(0);
     let before = engine.state.clone();
