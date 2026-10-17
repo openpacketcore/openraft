@@ -1,3 +1,7 @@
+use old::storage::Adaptor as LegacyStore;
+// The current MemStore exposes the shared fixture operations for both APIs.
+use old::RaftStorage;
+
 use super::*;
 
 // Preserve the exact vote, complete log and applied prefix across a binary
@@ -20,7 +24,6 @@ impl Store {
         macro_rules! export {
             ($raft:ident, $store:expr) => {{
                 use $raft::storage::RaftLogReader;
-                use $raft::RaftStorage;
                 let mut store = $store.clone();
                 let machine = store.get_state_machine().await;
                 Records {
@@ -45,8 +48,7 @@ struct Node {
 
 async fn start(id: u64, current: bool, state: Arc<NetworkState>, records: Option<Records>) -> Node {
     macro_rules! start {
-        ($raft:ident, $mem:ident, $config:ty, $variant:ident) => {{
-            use $raft::RaftStorage;
+        ($raft:ident, $mem:ident, $config:ty, $variant:ident, $adapter:ident) => {{
             let mut store = Arc::new($mem::MemStore::default());
             if let Some(records) = records {
                 let vote: Option<$raft::Vote<u64>> = decode(&records.vote);
@@ -64,7 +66,7 @@ async fn start(id: u64, current: bool, state: Arc<NetworkState>, records: Option
                 assert_eq!(records.vote, encode(&store.read_vote().await.unwrap()));
                 assert_eq!(records.log, encode(&entries));
             }
-            let (log, machine) = $raft::storage::Adaptor::new(store.clone());
+            let (log, machine) = $adapter::new(store.clone());
             let raft = $raft::Raft::new(
                 id,
                 Arc::new(
@@ -93,9 +95,9 @@ async fn start(id: u64, current: bool, state: Arc<NetworkState>, records: Option
         }};
     }
     let node = if current {
-        start!(new, openraft_memstore, NewConfig, Current)
+        start!(new, openraft_memstore, NewConfig, Current, CurrentStore)
     } else {
-        start!(old, legacy_memstore, OldConfig, Legacy)
+        start!(old, legacy_memstore, OldConfig, Legacy, LegacyStore)
     };
     state.nodes.lock().unwrap().insert(id, node.endpoint.clone());
     node

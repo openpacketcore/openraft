@@ -15,9 +15,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::time::Instant;
 
+use crate::fixtures::storage::Store as CurrentStore;
+
 type NewConfig = openraft_memstore::TypeConfig;
 type OldConfig = legacy_memstore::TypeConfig;
 
+#[path = "../fixtures/mod.rs"]
+mod fixtures;
 mod rolling;
 
 #[derive(Clone)]
@@ -181,7 +185,7 @@ network!(
 async fn fresh_upgraded_survivor_can_elect_with_a_stale_legacy_survivor() -> anyhow::Result<()> {
     let state = Arc::new(NetworkState::default());
     let current_store = Arc::new(openraft_memstore::MemStore::default());
-    let (log, machine) = new::storage::Adaptor::new(current_store.clone());
+    let (log, machine) = CurrentStore::new(current_store.clone());
     let current = new::Raft::new(
         1,
         Arc::new(
