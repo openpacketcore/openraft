@@ -24,6 +24,8 @@ use crate::fixtures::RaftRouter;
 /// - observes the joint configuration on node-4 while its uniform configuration is lost.
 /// - asserts replication stops and node-4 cannot disrupt the retained leader after its timers
 ///   expire.
+// The router hook requires its existing unboxed RPCError return type.
+#[allow(clippy::result_large_err)]
 #[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
 async fn add_remove_voter() -> Result<()> {
     let c01234 = btreeset![0, 1, 2, 3, 4];
