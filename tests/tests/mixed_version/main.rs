@@ -18,6 +18,8 @@ use tokio::time::Instant;
 type NewConfig = openraft_memstore::TypeConfig;
 type OldConfig = legacy_memstore::TypeConfig;
 
+mod rolling;
+
 #[derive(Clone)]
 enum Endpoint {
     Current(new::Raft<NewConfig>),
