@@ -12,6 +12,15 @@ use crate::TypeConfig;
 
 // --- Raft communication
 
+#[post("/raft-pre-vote")]
+pub async fn pre_vote(
+    app: Data<App>,
+    req: Json<openraft::raft::PreVoteRequest<NodeId>>,
+) -> actix_web::Result<impl Responder> {
+    let res = app.raft.pre_vote(req.0).await;
+    Ok(Json(res))
+}
+
 #[post("/raft-vote")]
 pub async fn vote(app: Data<App>, req: Json<VoteRequest<NodeId>>) -> actix_web::Result<impl Responder> {
     let res = app.raft.vote(req.0).await;

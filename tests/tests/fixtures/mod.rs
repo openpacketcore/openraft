@@ -43,6 +43,8 @@ use openraft::raft::AppendEntriesResponse;
 use openraft::raft::ClientWriteResponse;
 use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
+use openraft::raft::PreVoteRequest;
+use openraft::raft::PreVoteResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::storage::Adaptor;
@@ -192,7 +194,7 @@ impl RPCErrorType {
             RPCErrorType::Unreachable => Unreachable::new(&AnyError::error(msg)).into(),
             RPCErrorType::NetworkError => NetworkError::new(&AnyError::error(msg)).into(),
             RPCErrorType::PayloadTooLarge { action, entries_hint } => match action {
-                RPCTypes::Vote => {
+                RPCTypes::Vote | RPCTypes::PreVote => {
                     unreachable!("Vote RPC should not be too large")
                 }
                 RPCTypes::AppendEntries => PayloadTooLarge::new_entries_hint(*entries_hint).into(),
@@ -215,6 +217,7 @@ where C::SnapshotData: fmt::Debug
     AppendEntries(AppendEntriesRequest<C>),
     InstallSnapshot(InstallSnapshotRequest<C>),
     Vote(VoteRequest<C::NodeId>),
+    PreVote(PreVoteRequest<C::NodeId>),
 }
 
 impl<C: RaftTypeConfig> RPCRequest<C>
@@ -225,6 +228,7 @@ where C::SnapshotData: fmt::Debug
             RPCRequest::AppendEntries(_) => RPCTypes::AppendEntries,
             RPCRequest::InstallSnapshot(_) => RPCTypes::InstallSnapshot,
             RPCRequest::Vote(_) => RPCTypes::Vote,
+            RPCRequest::PreVote(_) => RPCTypes::PreVote,
         }
     }
 }
@@ -1132,6 +1136,20 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
         let resp = resp.map_err(|e| RemoteError::new(self.target, e))?;
 
         Ok(resp)
+    }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<MemNodeId>,
+        _option: RPCOption,
+    ) -> Result<PreVoteResponse<MemNodeId>, RPCError<MemNodeId, (), RaftError<MemNodeId>>> {
+        let from_id = rpc.vote.leader_id().voted_for().unwrap();
+        self.owner.count_rpc(RPCTypes::PreVote);
+        self.owner.call_rpc_pre_hook(rpc.clone(), from_id, self.target)?;
+        self.owner.emit_rpc_error(from_id, self.target)?;
+        self.owner.rand_send_delay().await;
+        let node = self.owner.get_raft_handle(&self.target)?;
+        node.pre_vote(rpc).await.map_err(|error| RemoteError::new(self.target, error).into())
     }
 
     /// Send a RequestVote RPC to the target Raft node (§5).

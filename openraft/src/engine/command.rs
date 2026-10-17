@@ -10,6 +10,8 @@ use crate::progress::entry::ProgressEntry;
 use crate::progress::Inflight;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::InstallSnapshotResponse;
+use crate::raft::PreVoteRequest;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
@@ -91,6 +93,12 @@ where C: RaftTypeConfig
     /// Send vote to all other members
     SendVote { vote_req: VoteRequest<C::NodeId> },
 
+    /// Send a volatile inquiry before starting a real election.
+    SendPreVote {
+        round: u64,
+        request: PreVoteRequest<C::NodeId>,
+    },
+
     /// Purge log from the beginning to `upto`, inclusive.
     PurgeLog { upto: LogId<C::NodeId> },
 
@@ -138,6 +146,7 @@ where
             (Command::RebuildReplicationStreams { targets },   Command::RebuildReplicationStreams { targets: b }, )                            => targets == b,
             (Command::SaveVote { vote },                       Command::SaveVote { vote: b })                                                  => vote == b,
             (Command::SendVote { vote_req },                   Command::SendVote { vote_req: b }, )                                            => vote_req == b,
+            (Command::SendPreVote { round, request },          Command::SendPreVote { round: b_round, request: b })                            => round == b_round && request == b,
             (Command::PurgeLog { upto },                       Command::PurgeLog { upto: b })                                                  => upto == b,
             (Command::DeleteConflictLog { since },             Command::DeleteConflictLog { since: b }, )                                      => since == b,
             (Command::Respond { when, resp: send },            Command::Respond { when: b_when, resp: b })                                     => send == b && when == b_when,
@@ -167,6 +176,7 @@ where C: RaftTypeConfig
             Command::ReplicateCommitted { .. }        => CommandKind::Network,
             Command::Replicate { .. }                 => CommandKind::Network,
             Command::SendVote { .. }                  => CommandKind::Network,
+            Command::SendPreVote { .. }               => CommandKind::Network,
 
             Command::StateMachine { .. }              => CommandKind::StateMachine,
             // Apply is firstly handled by RaftCore, then forwarded to state machine worker.
@@ -190,6 +200,7 @@ where C: RaftTypeConfig
             Command::RebuildReplicationStreams { .. } => None,
             Command::SaveVote { .. }                  => None,
             Command::SendVote { .. }                  => None,
+            Command::SendPreVote { .. }               => None,
             Command::PurgeLog { .. }                  => None,
             Command::DeleteConflictLog { .. }         => None,
             Command::Respond { when, .. }             => when.as_ref(),
@@ -231,6 +242,7 @@ pub(crate) enum Respond<C>
 where C: RaftTypeConfig
 {
     Vote(ValueSender<C, Result<VoteResponse<C::NodeId>, Infallible>>),
+    PreVote(ValueSender<C, Result<PreVoteResponse<C::NodeId>, Infallible>>),
     AppendEntries(ValueSender<C, Result<AppendEntriesResponse<C::NodeId>, Infallible>>),
     ReceiveSnapshotChunk(ValueSender<C, Result<(), InstallSnapshotError>>),
     InstallSnapshot(ValueSender<C, Result<InstallSnapshotResponse<C::NodeId>, InstallSnapshotError>>),
@@ -252,6 +264,7 @@ where C: RaftTypeConfig
     pub(crate) fn send(self) {
         match self {
             Respond::Vote(x) => x.send(),
+            Respond::PreVote(x) => x.send(),
             Respond::AppendEntries(x) => x.send(),
             Respond::ReceiveSnapshotChunk(x) => x.send(),
             Respond::InstallSnapshot(x) => x.send(),

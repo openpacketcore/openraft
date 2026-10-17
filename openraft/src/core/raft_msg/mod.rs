@@ -7,6 +7,8 @@ use crate::error::InitializeError;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
 use crate::raft::BoxCoreFn;
+use crate::raft::PreVoteRequest;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
 use crate::raft::TransferLeaderError;
 use crate::raft::TransferLeaderRequest;
@@ -33,6 +35,9 @@ pub(crate) type ResultSender<C, T, E = Infallible> = OneshotSenderOf<C, Result<T
 
 /// TX for Vote Response
 pub(crate) type VoteTx<C> = ResultSender<C, VoteResponse<NodeIdOf<C>>>;
+
+/// TX for a read-only speculative vote response.
+pub(crate) type PreVoteTx<C> = ResultSender<C, PreVoteResponse<NodeIdOf<C>>>;
 
 /// TX for Append Entries Response
 pub(crate) type AppendEntriesTx<C> = ResultSender<C, AppendEntriesResponse<NodeIdOf<C>>>;
@@ -68,6 +73,11 @@ where C: RaftTypeConfig
     RequestVote {
         rpc: VoteRequest<C::NodeId>,
         tx: VoteTx<C>,
+    },
+
+    PreVote {
+        rpc: PreVoteRequest<C::NodeId>,
+        tx: PreVoteTx<C>,
     },
 
     InstallFullSnapshot {
@@ -161,6 +171,7 @@ where C: RaftTypeConfig
             RaftMsg::RequestVote { rpc, .. } => {
                 format!("RequestVote: {}", rpc.summary())
             }
+            RaftMsg::PreVote { rpc, .. } => format!("PreVote: {}", rpc.summary()),
             RaftMsg::BeginReceivingSnapshot { .. } => "BeginReceivingSnapshot".to_string(),
             RaftMsg::InstallFullSnapshot { vote, snapshot, .. } => {
                 format!("InstallFullSnapshot: vote: {}, snapshot: {}", vote, snapshot)

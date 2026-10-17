@@ -23,6 +23,14 @@ impl Raft {
     }
 
     #[export_method]
+    pub async fn pre_vote(
+        &self,
+        request: openraft::raft::PreVoteRequest<u64>,
+    ) -> Result<openraft::raft::PreVoteResponse<u64>, toy_rpc::Error> {
+        self.app.raft.pre_vote(request).await.map_err(|e| toy_rpc::Error::Internal(Box::new(e)))
+    }
+
+    #[export_method]
     pub async fn vote(&self, vote: VoteRequest<u64>) -> Result<VoteResponse<u64>, toy_rpc::Error> {
         self.app.raft.vote(vote).await.map_err(|e| toy_rpc::Error::Internal(Box::new(e)))
     }

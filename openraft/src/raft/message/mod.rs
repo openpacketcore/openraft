@@ -17,7 +17,11 @@ pub use client_write::ClientWriteResult;
 pub use install_snapshot::InstallSnapshotRequest;
 pub use install_snapshot::InstallSnapshotResponse;
 pub use install_snapshot::SnapshotResponse;
+pub use pre_vote::PreVoteRequest;
+pub use pre_vote::PreVoteResponse;
 pub use transfer_leader::TransferLeaderError;
 pub use transfer_leader::TransferLeaderRequest;
 pub use vote::VoteRequest;
 pub use vote::VoteResponse;
+
+mod pre_vote;

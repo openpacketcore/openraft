@@ -76,7 +76,7 @@ struct Handoff {
     armed: AtomicBool,
     closed: AtomicBool,
     active_calls: AtomicUsize,
-    // 0: AppendEntries/read probe, 1: Vote, 2: snapshot transport.
+    // 0: AppendEntries/read probe, 1: Vote, 2: snapshot transport, 3: PreVote.
     rpc_kind: AtomicUsize,
     reply_success: AtomicBool,
     unavailable: Mutex<BTreeSet<u64>>,
@@ -421,6 +421,21 @@ impl RaftNetwork<TestConfig> for Peer {
         };
         self.handoff.active_calls.fetch_sub(1, Ordering::SeqCst);
         response
+    }
+
+    async fn pre_vote(
+        &mut self,
+        request: raft::raft::PreVoteRequest<u64>,
+        _: RPCOption,
+    ) -> Result<raft::raft::PreVoteResponse<u64>, RpcFailure> {
+        if self.unavailable() {
+            return Err(RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+                "peer unavailable",
+            ))));
+        }
+        let higher = self.hold_reply(3) && !self.handoff.reply_success.load(Ordering::SeqCst);
+        let actual = if higher { Vote::new(100, 3) } else { Vote::default() };
+        Ok(raft::raft::PreVoteResponse::new(actual, request.last_log_id, !higher))
     }
 
     async fn vote(&mut self, request: VoteRequest<u64>, _: RPCOption) -> Result<VoteResponse<u64>, RpcFailure> {

@@ -140,6 +140,15 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     }
 
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
+    async fn pre_vote(
+        &mut self,
+        req: openraft::raft::PreVoteRequest<NodeId>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::PreVoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
+        tracing::debug!(req = debug(&req), "pre-vote");
+        self.c().await?.raft().pre_vote(req).await.map_err(|e| to_error(e, self.target))
+    }
+
     async fn vote(
         &mut self,
         req: VoteRequest<NodeId>,

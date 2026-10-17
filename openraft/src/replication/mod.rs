@@ -406,7 +406,7 @@ where
         const DEFAULT_ENTRIES_HINT_TTL: u64 = 10;
 
         match too_large.action() {
-            RPCTypes::Vote => {
+            RPCTypes::Vote | RPCTypes::PreVote => {
                 unreachable!("Vote RPC should not be too large")
             }
             RPCTypes::AppendEntries => {

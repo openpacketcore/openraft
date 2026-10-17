@@ -97,6 +97,14 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         self.owner.send_rpc(self.target, &self.target_node, "raft-snapshot", req).await.map_err(|e| *e)
     }
 
+    async fn pre_vote(
+        &mut self,
+        req: openraft::raft::PreVoteRequest<NodeId>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::PreVoteResponse<NodeId>, typ::RPCError> {
+        self.owner.send_rpc(self.target, &self.target_node, "raft-pre-vote", req).await.map_err(|e| *e)
+    }
+
     async fn vote(
         &mut self,
         req: VoteRequest<NodeId>,

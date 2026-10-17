@@ -3,6 +3,7 @@ use crate::core::raft_msg::ClientReadTx;
 use crate::core::sm;
 use crate::error::Fatal;
 use crate::peer_admission::ResponseGeneration;
+use crate::raft::PreVoteResponse;
 use crate::raft::VoteResponse;
 use crate::replication;
 use crate::MessageSummary;
@@ -13,6 +14,13 @@ use crate::Vote;
 pub(crate) enum Notify<C>
 where C: RaftTypeConfig
 {
+    PreVoteResponse {
+        target: C::NodeId,
+        generation: ResponseGeneration,
+        round: u64,
+        resp: PreVoteResponse<C::NodeId>,
+    },
+
     VoteResponse {
         target: C::NodeId,
         generation: ResponseGeneration,
@@ -81,6 +89,16 @@ where C: RaftTypeConfig
 {
     fn summary(&self) -> String {
         match self {
+            Self::PreVoteResponse {
+                target, round, resp, ..
+            } => {
+                format!(
+                    "PreVoteResponse: from: {}, round: {}, {}",
+                    target,
+                    round,
+                    resp.summary()
+                )
+            }
             Self::VoteResponse {
                 target,
                 resp,

@@ -108,6 +108,7 @@ pub async fn start_example_raft_node(node_id: NodeId, http_addr: String) -> std:
             .service(raft::append)
             .service(raft::snapshot)
             .service(raft::vote)
+            .service(raft::pre_vote)
             // admin API
             .service(management::init)
             .service(management::add_learner)

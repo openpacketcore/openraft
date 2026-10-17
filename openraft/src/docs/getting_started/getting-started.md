@@ -171,6 +171,7 @@ The trait [`RaftNetwork`] defines the data transmission requirements.
 
 ```ignore
 pub trait RaftNetwork<C: RaftTypeConfig>: Send + Sync + 'static {
+    async fn pre_vote(&mut self, rpc: PreVoteRequest<C::NodeId>) -> Result<...>;
     async fn vote(&mut self, rpc: VoteRequest<C::NodeId>) -> Result<...>;
     async fn append_entries(&mut self, rpc: AppendEntriesRequest<C>) -> Result<...>;
     async fn snapshot(&mut self, vote: Vote<C::NodeId>, snapshot: Snapshot<C>) -> Result<...>;
@@ -189,6 +190,13 @@ Here is the list of methods that need to be implemented for the [`RaftNetwork`] 
 | [`append_entries()`]   | [`AppendEntriesRequest`] | remote node [`Raft::append_entries()`]         |
 | [`full_snapshot()`]    | [`Snapshot`]             | remote node [`Raft::install_full_snapshot()`] |
 | [`vote()`]             | [`VoteRequest`]          | remote node [`Raft::vote()`]                   |
+| [`pre_vote()`]         | [`PreVoteRequest`]       | remote node [`Raft::pre_vote()`]               |
+
+Pre-Vote is a read-only inquiry before an ordinary election. Authenticate it as
+voting traffic, but give it a distinct endpoint or wire family: forwarding a
+pre-vote to `vote()` would incorrectly persist the proposed future term. A
+receiver that does not support Pre-Vote must reject it; do not fall back to the
+real Vote RPC. The examples provide a separate Pre-Vote endpoint.
 
 [Mem KV Network](https://github.com/datafuselabs/openraft/blob/main/examples/raft-kv-memstore/src/network/raft_network_impl.rs)
 demonstrates how to forward messages to other Raft nodes using [`reqwest`](https://docs.rs/reqwest/latest/reqwest/) as network transport layer.
@@ -299,7 +307,7 @@ async fn main() -> std::io::Result<()> {
               .app_data(app.clone())
 
               // raft internal RPC
-              .service(raft::append).service(raft::snapshot).service(raft::vote)
+              .service(raft::append).service(raft::snapshot).service(raft::vote).service(raft::pre_vote)
 
               // admin API
               .service(management::init)
@@ -342,10 +350,12 @@ Additionally, two test scripts for setting up a cluster are available:
 [`Raft`]:                               `crate::Raft`
 [`Raft::append_entries()`]:             `crate::Raft::append_entries`
 [`Raft::vote()`]:                       `crate::Raft::vote`
+[`Raft::pre_vote()`]:                   `crate::Raft::pre_vote`
 [`Raft::install_full_snapshot()`]:  `crate::Raft::install_full_snapshot`
 
 [`AppendEntriesRequest`]:               `crate::raft::AppendEntriesRequest`
 [`VoteRequest`]:                        `crate::raft::VoteRequest`
+[`PreVoteRequest`]:                     `crate::raft::PreVoteRequest`
 [`InstallSnapshotRequest`]:             `crate::raft::InstallSnapshotRequest`
 
 [`AppData`]:                            `crate::AppData`
@@ -387,6 +397,7 @@ Additionally, two test scripts for setting up a cluster are available:
 [`RaftNetwork`]:                        `crate::network::RaftNetwork`
 [`append_entries()`]:                   `crate::RaftNetwork::append_entries`
 [`vote()`]:                             `crate::RaftNetwork::vote`
+[`pre_vote()`]:                         `crate::RaftNetwork::pre_vote`
 [`full_snapshot()`]:                         `crate::RaftNetwork::full_snapshot`
 
 

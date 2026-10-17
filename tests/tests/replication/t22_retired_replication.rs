@@ -765,6 +765,14 @@ impl<C: FixtureConfig> RaftNetwork<C> for ObservedConnection {
             .await
     }
 
+    async fn pre_vote(
+        &mut self,
+        rpc: openraft::raft::PreVoteRequest<u64>,
+        option: RPCOption,
+    ) -> Result<openraft::raft::PreVoteResponse<u64>, RPCError<u64, (), RaftError<u64>>> {
+        self.inner.pre_vote(rpc, option).await
+    }
+
     async fn vote(
         &mut self,
         rpc: VoteRequest<u64>,

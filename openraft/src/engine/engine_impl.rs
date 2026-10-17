@@ -20,6 +20,7 @@ use crate::engine::handler::server_state_handler::ServerStateHandler;
 use crate::engine::handler::snapshot_handler::SnapshotHandler;
 use crate::engine::handler::vote_handler::VoteHandler;
 use crate::engine::leadership_transfer::PreparedShutdown;
+use crate::engine::pre_vote::PreVote;
 use crate::engine::Command;
 use crate::engine::EngineOutput;
 use crate::engine::Respond;
@@ -91,6 +92,10 @@ where C: RaftTypeConfig
     /// without losing leadership status.
     pub(crate) candidate: CandidateState<C>,
 
+    /// A speculative election round, separate from persisted votes.
+    pub(crate) pre_vote: Option<PreVote<C>>,
+    pub(crate) pre_vote_round: u64,
+
     /// Retirement is irreversible for this engine instance, including after a new vote.
     pub(crate) prepared_shutdown: Option<PreparedShutdown<C::NodeId>>,
 
@@ -111,6 +116,8 @@ where C: RaftTypeConfig
             seen_greater_log: false,
             leader: None,
             candidate: None,
+            pre_vote: None,
+            pre_vote_round: 0,
             prepared_shutdown: None,
             output: EngineOutput::new(4096),
         }
@@ -227,6 +234,15 @@ where C: RaftTypeConfig
         // A campaign consumes the timeout selected for it. Select a new timeout
         // for the next campaign so repeated split votes do not remain in lockstep.
         self.config.resample_election_timeout::<C::AsyncRuntime>();
+        self.elect_with_current_timeout();
+    }
+
+    /// Begin the real election after a pre-vote quorum, without sampling twice.
+    pub(super) fn elect_with_current_timeout(&mut self) {
+        if self.prepared_shutdown.is_some() {
+            return;
+        }
+        self.pre_vote = None;
         // Leadership must be relinquished before campaigning: a Leader that campaigns keeps
         // `leader.vote` at the old term while `state.vote` moves to the new one, which breaks the
         // invariant `LeaderHandler` relies on.

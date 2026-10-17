@@ -488,6 +488,15 @@ mod tests {
             unimplemented!()
         }
 
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
+            unimplemented!()
+        }
+
         async fn vote(
             &mut self,
             _rpc: VoteRequest<C::NodeId>,
@@ -589,6 +598,15 @@ mod tests {
             _rpc: AppendEntriesRequest<C>,
             _option: RPCOption,
         ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
             unimplemented!()
         }
 
@@ -713,6 +731,15 @@ mod tests {
             unimplemented!()
         }
 
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
+            unimplemented!()
+        }
+
         async fn vote(
             &mut self,
             _rpc: VoteRequest<C::NodeId>,
@@ -792,6 +819,15 @@ mod tests {
             unimplemented!()
         }
 
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
+            unimplemented!()
+        }
+
         async fn vote(
             &mut self,
             _rpc: VoteRequest<C::NodeId>,
@@ -866,6 +902,15 @@ mod tests {
             _rpc: AppendEntriesRequest<C>,
             _option: RPCOption,
         ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
             unimplemented!()
         }
 
@@ -952,6 +997,15 @@ mod tests {
             _rpc: AppendEntriesRequest<C>,
             _option: RPCOption,
         ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
             unimplemented!()
         }
 
@@ -1053,6 +1107,15 @@ mod tests {
             _rpc: AppendEntriesRequest<C>,
             _option: RPCOption,
         ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
             unimplemented!()
         }
 
@@ -1160,6 +1223,15 @@ mod tests {
             _rpc: AppendEntriesRequest<C>,
             _option: RPCOption,
         ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn pre_vote(
+            &mut self,
+            _rpc: crate::raft::PreVoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<crate::raft::PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>
+        {
             unimplemented!()
         }
 

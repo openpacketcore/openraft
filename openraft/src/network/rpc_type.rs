@@ -8,6 +8,7 @@ pub enum RPCTypes {
     Vote,
     AppendEntries,
     InstallSnapshot,
+    PreVote,
 }
 
 impl fmt::Display for RPCTypes {

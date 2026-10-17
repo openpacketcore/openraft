@@ -56,7 +56,9 @@ where C: RaftTypeConfig
     pub(crate) fn spawn(interval: Duration, tx: mpsc::UnboundedSender<Notify<C>>, enabled: bool) -> TickHandle<C> {
         let enabled = Arc::new(AtomicBool::from(enabled));
         let this = Self {
-            interval,
+            // Election deadlines must not be rounded to the heartbeat period.
+            // Core keeps a separate deadline for sending heartbeats.
+            interval: interval.min(Duration::from_millis(100)),
             enabled: enabled.clone(),
             tx,
         };
@@ -177,6 +179,19 @@ mod tests {
     // AsyncRuntime::spawn is `spawn_local` with singlethreaded enabled.
     // It will result in a panic:
     // `spawn_local` called from outside of a `task::LocalSet`.
+    #[cfg(not(feature = "singlethreaded"))]
+    #[tokio::test(start_paused = true)]
+    async fn election_ticks_remain_precise_with_a_long_heartbeat_period() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        let handle = Tick::<TickUTConfig>::spawn(Duration::from_secs(3), tx, true);
+        rx.recv().await.expect("first election evaluation");
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        rx.recv().await.expect("second election evaluation");
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
+        handle.shutdown().unwrap().await.unwrap();
+    }
+
     #[cfg(not(feature = "singlethreaded"))]
     #[tokio::test]
     async fn test_shutdown() -> anyhow::Result<()> {

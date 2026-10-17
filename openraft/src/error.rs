@@ -471,7 +471,7 @@ impl fmt::Display for PayloadTooLarge {
 
         write!(f, " hint:(")?;
         match self.action {
-            RPCTypes::Vote => {
+            RPCTypes::Vote | RPCTypes::PreVote => {
                 unreachable!("vote rpc should not have payload")
             }
             RPCTypes::AppendEntries => {

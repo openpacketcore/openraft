@@ -1,6 +1,7 @@
 //! A minimized store with least cost for benchmarking Openraft.
 
-#[cfg(feature = "bt")] use std::backtrace::Backtrace;
+#[cfg(feature = "bt")]
+use std::backtrace::Backtrace;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -111,6 +112,15 @@ impl RaftNetwork<MemConfig> for Network {
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, RPCError<NodeId, (), RaftError<NodeId, InstallSnapshotError>>> {
         let resp = self.target_raft.install_snapshot(rpc).await.map_err(|e| RemoteError::new(self.target, e))?;
+        Ok(resp)
+    }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: openraft::raft::PreVoteRequest<NodeId>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::PreVoteResponse<NodeId>, RPCError<NodeId, (), RaftError<NodeId>>> {
+        let resp = self.target_raft.pre_vote(rpc).await.map_err(|e| RemoteError::new(self.target, e))?;
         Ok(resp)
     }
 

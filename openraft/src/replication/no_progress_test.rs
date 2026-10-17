@@ -273,6 +273,14 @@ impl RaftNetwork<C> for ReadyNetwork {
         Err(StreamingError::Closed(ReplicationClosed::new("unexpected snapshot")))
     }
 
+    async fn pre_vote(
+        &mut self,
+        _rpc: crate::raft::PreVoteRequest<u64>,
+        _option: RPCOption,
+    ) -> Result<crate::raft::PreVoteResponse<u64>, RPCError<u64, (), RaftError<u64>>> {
+        Err(NetworkError::new(&std::io::Error::other("unexpected pre-vote RPC")).into())
+    }
+
     async fn vote(
         &mut self,
         _rpc: VoteRequest<u64>,

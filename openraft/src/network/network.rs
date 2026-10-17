@@ -12,6 +12,8 @@ use crate::network::rpc_option::RPCOption;
 use crate::network::Backoff;
 use crate::raft::AppendEntriesRequest;
 use crate::raft::AppendEntriesResponse;
+use crate::raft::PreVoteRequest;
+use crate::raft::PreVoteResponse;
 use crate::raft::SnapshotResponse;
 use crate::raft::VoteRequest;
 use crate::raft::VoteResponse;
@@ -78,6 +80,16 @@ where C: RaftTypeConfig
         rpc: VoteRequest<C::NodeId>,
         option: RPCOption,
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>;
+
+    /// Send a speculative vote inquiry using a distinct, authenticated RPC.
+    ///
+    /// Never implement this by sending a real Vote RPC: a pre-vote must not
+    /// change the receiver's term, persistent vote or election timer.
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<C::NodeId>,
+        option: RPCOption,
+    ) -> Result<PreVoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>>;
 
     /// Send a complete Snapshot to the target.
     ///

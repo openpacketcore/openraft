@@ -66,6 +66,19 @@ impl RaftNetwork<TypeConfig> for Connection {
         Ok(resp)
     }
 
+    async fn pre_vote(
+        &mut self,
+        req: openraft::raft::PreVoteRequest<NodeId>,
+        _option: RPCOption,
+    ) -> Result<openraft::raft::PreVoteResponse<NodeId>, typ::RPCError> {
+        let resp = self
+            .router
+            .send(self.target, "/raft/pre-vote", req)
+            .await
+            .map_err(|e| RemoteError::new(self.target, *e))?;
+        Ok(resp)
+    }
+
     async fn vote(
         &mut self,
         req: VoteRequest<NodeId>,

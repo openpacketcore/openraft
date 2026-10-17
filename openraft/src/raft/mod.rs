@@ -38,6 +38,8 @@ pub use message::ClientWriteResponse;
 pub use message::ClientWriteResult;
 pub use message::InstallSnapshotRequest;
 pub use message::InstallSnapshotResponse;
+pub use message::PreVoteRequest;
+pub use message::PreVoteResponse;
 pub use message::SnapshotResponse;
 pub use message::TransferLeaderError;
 pub use message::TransferLeaderRequest;
@@ -424,6 +426,20 @@ where C: RaftTypeConfig
 
         let (tx, rx) = C::AsyncRuntime::oneshot();
         self.inner.call_core(RaftMsg::RequestVote { rpc, tx }, rx).await
+    }
+
+    /// Ask whether this node would grant a future vote without changing its state.
+    ///
+    /// This RPC does not persist a vote, adopt a proposed term or refresh a lease.
+    /// Applications must authenticate it as voting traffic and keep its wire
+    /// family distinct from the real [`Self::vote`] RPC.
+    #[tracing::instrument(level = "debug", skip(self, rpc))]
+    pub async fn pre_vote(
+        &self,
+        rpc: PreVoteRequest<C::NodeId>,
+    ) -> Result<PreVoteResponse<C::NodeId>, RaftError<C::NodeId>> {
+        let (tx, rx) = C::AsyncRuntime::oneshot();
+        self.inner.call_core(RaftMsg::PreVote { rpc, tx }, rx).await
     }
 
     /// Stop admitting leader operations and issue an exact planned handoff.

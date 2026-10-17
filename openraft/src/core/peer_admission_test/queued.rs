@@ -36,6 +36,129 @@ use crate::StorageIOError;
 
 type Core = RaftCore<TestConfig, Network, MemoryStore, MemoryStore>;
 
+#[tokio::test(start_paused = true)]
+async fn a_fence_rejects_queued_pre_vote_grants_and_higher_actual_terms() {
+    for higher in [false, true] {
+        let mut core = core(&[1, 2, 3], false);
+        core.engine.pre_elect();
+        let round = core.engine.pre_vote.as_ref().unwrap().round;
+        core.engine.output.take_commands();
+        core.tx_notify
+            .send(Notify::PreVoteResponse {
+                target: 3,
+                generation: core.peer_admission.generation.clone(),
+                round,
+                resp: raft::raft::PreVoteResponse::new(
+                    if higher { Vote::new(100, 3) } else { Vote::new(5, 1) },
+                    Some(log(10)),
+                    !higher,
+                ),
+            })
+            .unwrap();
+        let receipt = fence(&mut core, 3).await;
+        let before = core.engine.state.clone();
+        consume(&mut core).unwrap();
+        assert_eq!(before, core.engine.state);
+        assert!(core.engine.output.take_commands().is_empty());
+        assert_eq!(
+            vec![1],
+            core.engine.pre_vote.as_ref().unwrap().candidate.granters().collect::<Vec<_>>()
+        );
+
+        release(&mut core, receipt).await;
+        core.handle_notify(Notify::PreVoteResponse {
+            target: 3,
+            generation: core.peer_admission.generation.clone(),
+            round,
+            resp: raft::raft::PreVoteResponse::new(Vote::new(5, 1), Some(log(10)), true),
+        })
+        .unwrap();
+        assert_eq!(Vote::new(6, 1), *core.engine.state.vote_ref());
+        assert!(core.engine.leader.is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fence_revokes_pre_vote_grants_already_counted() {
+    let mut core = core(&[1, 2, 3, 4, 5], false);
+    core.engine.pre_elect();
+    let round = core.engine.pre_vote.as_ref().unwrap().round;
+    core.engine.output.take_commands();
+    let original_generation = core.peer_admission.generation.clone();
+    core.handle_notify(Notify::PreVoteResponse {
+        target: 2,
+        generation: original_generation.clone(),
+        round,
+        resp: raft::raft::PreVoteResponse::new(Vote::new(5, 1), Some(log(10)), true),
+    })
+    .unwrap();
+    let receipt = fence(&mut core, 2).await;
+    core.handle_notify(Notify::PreVoteResponse {
+        target: 3,
+        generation: core.peer_admission.generation.clone(),
+        round,
+        resp: raft::raft::PreVoteResponse::new(Vote::new(5, 1), Some(log(10)), true),
+    })
+    .unwrap();
+    assert_eq!(Vote::new(5, 1), *core.engine.state.vote_ref());
+    assert!(core.engine.output.take_commands().is_empty());
+    release(&mut core, receipt).await;
+    core.handle_notify(Notify::PreVoteResponse {
+        target: 2,
+        generation: original_generation,
+        round,
+        resp: raft::raft::PreVoteResponse::new(Vote::new(5, 1), Some(log(10)), true),
+    })
+    .unwrap();
+    assert_eq!(Vote::new(5, 1), *core.engine.state.vote_ref());
+    assert!(core.engine.output.take_commands().is_empty());
+    core.handle_notify(Notify::PreVoteResponse {
+        target: 2,
+        generation: core.peer_admission.generation.clone(),
+        round,
+        resp: raft::raft::PreVoteResponse::new(Vote::new(5, 1), Some(log(10)), true),
+    })
+    .unwrap();
+    assert_eq!(Vote::new(6, 1), *core.engine.state.vote_ref());
+    assert!(matches!(core.engine.output.take_commands().as_slice(), [
+        crate::engine::Command::SaveVote { .. },
+        crate::engine::Command::SendVote { .. }
+    ]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unanswered_pre_vote_retries_use_their_own_deadline_without_inflating_term() {
+    let mut core = core(&[1, 2, 3], false);
+    core.runtime_config.enable_elect.store(true, Ordering::Relaxed);
+    core.engine.config.election_timeout_min = 100;
+    core.engine.config.election_timeout_max = 101;
+    core.engine.config.timer_config.election_timeout = Duration::from_millis(100);
+    let before = core.engine.state.clone();
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    core.handle_notify(Notify::Tick { i: 1 }).unwrap();
+    assert!(core.engine.output.take_commands().is_empty());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    core.handle_notify(Notify::Tick { i: 2 }).unwrap();
+    let first = core.engine.pre_vote.as_ref().unwrap().round;
+    assert!(matches!(core.engine.output.take_commands().as_slice(), [
+        crate::engine::Command::SendPreVote { .. }
+    ]));
+    assert_eq!(before, core.engine.state);
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    core.handle_notify(Notify::Tick { i: 3 }).unwrap();
+    assert_eq!(first, core.engine.pre_vote.as_ref().unwrap().round);
+    assert!(core.engine.output.take_commands().is_empty());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    core.handle_notify(Notify::Tick { i: 4 }).unwrap();
+    assert_ne!(first, core.engine.pre_vote.as_ref().unwrap().round);
+    assert!(matches!(core.engine.output.take_commands().as_slice(), [
+        crate::engine::Command::SendPreVote { .. }
+    ]));
+    assert_eq!(before, core.engine.state);
+}
+
 #[tokio::test]
 async fn resign_commands_recheck_the_current_sender_response_fence() {
     let mut core = core(&[1, 2, 3], false);

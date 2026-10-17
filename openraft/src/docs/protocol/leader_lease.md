@@ -38,6 +38,31 @@ Different timeout settings are used for committed and uncommitted votes.
 This is because a committed vote indicates the presence of an established
 **leader**, while an uncommitted vote merely represents a **candidate**.
 
+Automatic and explicitly triggered elections first run Pre-Vote, as described
+in the [Raft dissertation, section 9.6](https://raw.githubusercontent.com/ongardie/dissertation/master/leaderelection/prevote.tex). An
+inquiry asks whether a voter would accept a proposed future vote given its log
+and current leader lease. It does not change the recipient's term, vote,
+timestamp or storage. A quorum of speculative grants starts the existing real
+election: the self-vote is persisted, and leadership still requires a quorum of
+real votes. Pre-Vote does not change any quorum or persistence safety rule.
+An established leader also checks recent quorum acknowledgements when deciding
+whether to grant an inquiry. It does not mutate that clock progress. A healthy
+leader therefore rejects disruptive inquiries, while an expired quorum lease
+allows another voter to recover leadership through ordinary voting.
+
+An unsuccessful inquiry uses a separate volatile retry deadline, with the
+existing randomized election timeout and smaller-log backoff. It does not
+inflate the persisted term or refresh the old leader's lease. Replies are
+discarded after a new round, a vote, heartbeat, log or membership change,
+retirement, or a peer-response fence. Joint membership still requires both
+majorities. Bootstrap and an authenticated exact-vote planned handoff retain
+their ordinary persisted election path.
+
+Election deadlines are evaluated at intervals of at most 100 ms, independently
+of the heartbeat period. Heartbeat emission retains its own configured deadline.
+These timers govern liveness; Pre-Vote adds no clock-based safety decision and
+does not change the configured lease or election timeouts.
+
 
 For an uncommitted vote (the vote that is saved upon receiving a `VoteRequest`):
 

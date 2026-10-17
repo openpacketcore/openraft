@@ -41,6 +41,11 @@ pub async fn read(app: &mut App, req: String) -> String {
 
 // Raft API
 
+pub async fn pre_vote(app: &mut App, req: String) -> String {
+    let res = app.raft.pre_vote(decode(&req)).await;
+    encode(res)
+}
+
 pub async fn vote(app: &mut App, req: String) -> String {
     let res = app.raft.vote(decode(&req)).await;
     encode(res)
