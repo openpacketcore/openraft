@@ -13,7 +13,12 @@ use anyhow::Result;
 use maplit::btreeset;
 use openraft::error::Fatal;
 use openraft::raft::AppendEntriesRequest;
-use openraft::storage::Adaptor;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::LogFlushed;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::RaftLogStorage;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::RaftStateMachine;
 use openraft::CommittedLeaderId;
 use openraft::Config;
 use openraft::Entry;
@@ -26,6 +31,7 @@ use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftLogReader;
 use openraft::RaftSnapshotBuilder;
+#[cfg(not(feature = "storage-v2"))]
 use openraft::RaftStorage;
 use openraft::Snapshot;
 use openraft::SnapshotMeta;
@@ -43,6 +49,7 @@ use tokio::sync::watch;
 use tokio::sync::Semaphore;
 
 use crate::fixtures::init_default_ut_tracing;
+use crate::fixtures::storage::Store;
 use crate::fixtures::RaftRouter;
 
 #[derive(Clone, Copy, Debug)]
@@ -177,10 +184,7 @@ impl RaftLogReader<TypeConfig> for ObservedStore {
     }
 }
 
-impl RaftStorage<TypeConfig> for ObservedStore {
-    type LogReader = Arc<MemStore>;
-    type SnapshotBuilder = Arc<MemStore>;
-
+impl ObservedStore {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         if let Some(probe) = &self.persistence {
             if probe.enabled.load(Ordering::Acquire) {
@@ -207,7 +211,7 @@ impl RaftStorage<TypeConfig> for ObservedStore {
         self.inner.get_log_state().await
     }
 
-    async fn get_log_reader(&mut self) -> Self::LogReader {
+    async fn get_log_reader(&mut self) -> Arc<MemStore> {
         self.inner.get_log_reader().await
     }
 
@@ -260,7 +264,7 @@ impl RaftStorage<TypeConfig> for ObservedStore {
         Ok(results)
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+    async fn get_snapshot_builder(&mut self) -> Arc<MemStore> {
         let (frontier, _) = self.inner.last_applied_state().await.expect("test applied observation");
         self.builder_frontiers.lock().expect("test observation mutex").push(frontier);
         self.inner.get_snapshot_builder().await
@@ -289,6 +293,167 @@ impl RaftStorage<TypeConfig> for ObservedStore {
     }
 }
 
+#[cfg(not(feature = "storage-v2"))]
+impl RaftStorage<TypeConfig> for ObservedStore {
+    type LogReader = Arc<MemStore>;
+    type SnapshotBuilder = Arc<MemStore>;
+
+    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_vote(self, vote).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
+        ObservedStore::read_vote(self).await
+    }
+
+    async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_committed(self, committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+        ObservedStore::read_committed(self).await
+    }
+
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
+        ObservedStore::get_log_state(self).await
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        ObservedStore::get_log_reader(self).await
+    }
+
+    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
+    where I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend {
+        ObservedStore::append_to_log(self, entries).await
+    }
+
+    async fn delete_conflict_logs_since(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::delete_conflict_logs_since(self, log_id).await
+    }
+
+    async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::purge_logs_upto(self, log_id).await
+    }
+
+    async fn last_applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, ()>), StorageError<u64>> {
+        ObservedStore::last_applied_state(self).await
+    }
+
+    async fn apply_to_state_machine(
+        &mut self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<Vec<ClientResponse>, StorageError<u64>> {
+        ObservedStore::apply_to_state_machine(self, entries).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        ObservedStore::get_snapshot_builder(self).await
+    }
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+        ObservedStore::begin_receiving_snapshot(self).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, ()>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<u64>> {
+        ObservedStore::install_snapshot(self, meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+        ObservedStore::get_current_snapshot(self).await
+    }
+}
+
+#[cfg(feature = "storage-v2")]
+impl RaftLogStorage<TypeConfig> for ObservedStore {
+    type LogReader = Arc<MemStore>;
+
+    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_vote(self, vote).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
+        ObservedStore::read_vote(self).await
+    }
+
+    async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_committed(self, committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+        ObservedStore::read_committed(self).await
+    }
+
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
+        ObservedStore::get_log_state(self).await
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        ObservedStore::get_log_reader(self).await
+    }
+
+    async fn append<I>(&mut self, entries: I, callback: LogFlushed<TypeConfig>) -> Result<(), StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        ObservedStore::append_to_log(self, entries).await?;
+        callback.log_io_completed(Ok(()));
+        Ok(())
+    }
+
+    async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::delete_conflict_logs_since(self, log_id).await
+    }
+
+    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::purge_logs_upto(self, log_id).await
+    }
+}
+
+#[cfg(feature = "storage-v2")]
+impl RaftStateMachine<TypeConfig> for ObservedStore {
+    type SnapshotBuilder = Arc<MemStore>;
+
+    async fn applied_state(&mut self) -> Result<(Option<LogId<u64>>, StoredMembership<u64, ()>), StorageError<u64>> {
+        ObservedStore::last_applied_state(self).await
+    }
+
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ClientResponse>, StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        ObservedStore::apply_to_state_machine(self, &entries).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        ObservedStore::get_snapshot_builder(self).await
+    }
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+        ObservedStore::begin_receiving_snapshot(self).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, ()>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<u64>> {
+        ObservedStore::install_snapshot(self, meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+        ObservedStore::get_current_snapshot(self).await
+    }
+}
+
 #[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
 async fn bounded_apply_preserves_replication_ack_and_complete_ordered_prefix() -> Result<()> {
     let config = Arc::new(
@@ -303,7 +468,7 @@ async fn bounded_apply_preserves_replication_ack_and_complete_ordered_prefix() -
     let storage = Arc::new(MemStore::new());
     storage.enable_saving_committed.store(true, Ordering::Release);
     // Separate adapters keep the apply gate from locking the log-side adapter.
-    let (log, _) = Adaptor::new(storage.clone());
+    let (log, _) = Store::new(storage.clone());
     let gate = Arc::new(Semaphore::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
     let applied = Arc::new(Mutex::new(Vec::new()));
@@ -323,7 +488,7 @@ async fn bounded_apply_preserves_replication_ack_and_complete_ordered_prefix() -
         install_gate: Arc::new(Semaphore::new(1)),
         install_entered: watch::channel(0).0,
     };
-    let (_, state) = Adaptor::new(state);
+    let (_, state) = Store::new(state);
     let raft = Raft::<TypeConfig>::new(0, config, network, log, state).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let id = |index| LogId::new(CommittedLeaderId::new(1, 2), index);
@@ -432,7 +597,7 @@ impl ObservedNode {
         let persistence = PersistenceProbe::new();
         log_store.persistence = Some(persistence.clone());
         let maintenance_frontiers = log_store.maintenance_frontiers.clone();
-        let (log, _) = Adaptor::new(log_store);
+        let (log, _) = Store::new(log_store);
         let gate = Arc::new(Semaphore::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -457,7 +622,7 @@ impl ObservedNode {
             install_gate: install_gate.clone(),
             install_entered,
         };
-        let (_, state) = Adaptor::new(state);
+        let (_, state) = Store::new(state);
         let network = RaftRouter::new(config.clone());
         let raft = Raft::<TypeConfig>::new(0, config, network, log, state).await?;
         Ok(Self {
@@ -978,7 +1143,7 @@ async fn bounded_apply_shutdown_and_restart_replay_only_unapplied_suffix() -> Re
         *node.applied.lock().expect("test observation mutex"),
         (0..128).collect::<Vec<_>>()
     );
-    let (log, _) = Adaptor::new(node.store.clone());
+    let (log, _) = Store::new(node.store.clone());
     let (entered, _) = watch::channel(0);
     let (released, observed_release) = oneshot::channel();
     let state = ObservedStore {
@@ -996,7 +1161,7 @@ async fn bounded_apply_shutdown_and_restart_replay_only_unapplied_suffix() -> Re
         install_gate: Arc::new(Semaphore::new(1)),
         install_entered: watch::channel(0).0,
     };
-    let (_, state) = Adaptor::new(state);
+    let (_, state) = Store::new(state);
     let network = RaftRouter::new(config.clone());
     let reopened = tokio::time::timeout_at(deadline, Raft::<TypeConfig>::new(0, config, network, log, state)).await??;
     tokio::time::timeout_at(

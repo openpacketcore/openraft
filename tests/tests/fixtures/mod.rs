@@ -47,7 +47,6 @@ use openraft::raft::PreVoteRequest;
 use openraft::raft::PreVoteResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use openraft::storage::Adaptor;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftStateMachine;
 use openraft::Config;
@@ -80,11 +79,13 @@ use pretty_assertions::assert_ne;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::fixtures::logging::init_file_logging;
+use crate::fixtures::storage::Store;
 
 pub mod logging;
+pub mod storage;
 
-pub type MemLogStore = Adaptor<MemConfig, Arc<MemStore>>;
-pub type MemStateMachine = Adaptor<MemConfig, Arc<MemStore>>;
+pub type MemLogStore = Store<MemConfig, Arc<MemStore>>;
+pub type MemStateMachine = Store<MemConfig, Arc<MemStore>>;
 
 /// A concrete Raft type used during testing.
 pub type MemRaft = Raft<MemConfig>;
@@ -493,7 +494,7 @@ impl TypedRaftRouter {
     pub fn new_store(&mut self) -> (MemLogStore, MemStateMachine) {
         let store = Arc::new(MemStore::default());
         store.enable_saving_committed.store(self.enable_saving_committed, Ordering::Relaxed);
-        let (log, sm) = Adaptor::new(store);
+        let (log, sm) = Store::new(store);
         (log, sm)
     }
 

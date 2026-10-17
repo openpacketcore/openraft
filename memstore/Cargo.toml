@@ -1,6 +1,6 @@
 [package]
 name = "openraft-memstore"
-description = "A in-memory implementation of the `openraft::RaftStorage` trait."
+description = "An in-memory implementation of the OpenRaft storage traits."
 documentation = "https://docs.rs/openraft-memstore"
 readme = "README.md"
 

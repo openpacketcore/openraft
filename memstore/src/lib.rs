@@ -14,15 +14,22 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+#[cfg(feature = "storage-v2")]
+use openraft::storage::LogFlushed;
 use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::RaftStateMachine;
 use openraft::storage::Snapshot;
 use openraft::Entry;
 use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::OptionalSend;
 use openraft::RaftLogId;
+#[cfg(not(feature = "storage-v2"))]
 use openraft::RaftStorage;
 use openraft::RaftTypeConfig;
 use openraft::SnapshotMeta;
@@ -115,7 +122,7 @@ pub enum BlockOperation {
     PurgeLog,
 }
 
-/// An in-memory storage system implementing the `RaftStorage` trait.
+/// In-memory storage supporting both the legacy and v2 storage traits.
 pub struct MemStore {
     last_purged_log_id: RwLock<Option<LogId<MemNodeId>>>,
 
@@ -146,7 +153,7 @@ pub struct MemStore {
     /// When set, [`begin_receiving_snapshot()`] panics, simulating the state machine worker task
     /// dying while `RaftCore` keeps running.
     ///
-    /// [`begin_receiving_snapshot()`]: openraft::RaftStorage::begin_receiving_snapshot
+    /// [`begin_receiving_snapshot()`]: openraft::storage::RaftStateMachine::begin_receiving_snapshot
     panic_on_begin_receiving_snapshot: AtomicBool,
 
     /// When set, [`limited_get_log_entries()`] returns an empty result for a non-empty range,
@@ -334,8 +341,9 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<MemStore> {
     }
 }
 
-impl RaftStorage<TypeConfig> for Arc<MemStore> {
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<MemNodeId>> {
+// Keep storage behavior and test controls shared by both trait implementations.
+impl MemStore {
+    pub async fn get_log_state(self: &mut Arc<Self>) -> Result<LogState<TypeConfig>, StorageError<MemNodeId>> {
         let log = self.log.read().await;
         let last_serialized = log.iter().next_back().map(|(_, ent)| ent);
 
@@ -362,7 +370,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn save_vote(&mut self, vote: &Vote<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+    pub async fn save_vote(self: &mut Arc<Self>, vote: &Vote<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
         tracing::debug!(?vote, "save_vote");
         let mut h = self.vote.write().await;
 
@@ -370,11 +378,14 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote<MemNodeId>>, StorageError<MemNodeId>> {
+    pub async fn read_vote(self: &mut Arc<Self>) -> Result<Option<Vote<MemNodeId>>, StorageError<MemNodeId>> {
         Ok(*self.vote.read().await)
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<MemNodeId>>) -> Result<(), StorageError<MemNodeId>> {
+    pub async fn save_committed(
+        self: &mut Arc<Self>,
+        committed: Option<LogId<MemNodeId>>,
+    ) -> Result<(), StorageError<MemNodeId>> {
         let enabled = self.enable_saving_committed.load(Ordering::Relaxed);
         tracing::debug!(?committed, "save_committed, enabled: {}", enabled);
         if !enabled {
@@ -385,7 +396,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         Ok(())
     }
 
-    async fn read_committed(&mut self) -> Result<Option<LogId<MemNodeId>>, StorageError<MemNodeId>> {
+    pub async fn read_committed(self: &mut Arc<Self>) -> Result<Option<LogId<MemNodeId>>, StorageError<MemNodeId>> {
         let enabled = self.enable_saving_committed.load(Ordering::Relaxed);
         tracing::debug!("read_committed, enabled: {}", enabled);
         if !enabled {
@@ -395,15 +406,18 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         Ok(*self.committed.read().await)
     }
 
-    async fn last_applied_state(
-        &mut self,
+    pub async fn last_applied_state(
+        self: &mut Arc<Self>,
     ) -> Result<(Option<LogId<MemNodeId>>, StoredMembership<MemNodeId, ()>), StorageError<MemNodeId>> {
         let sm = self.sm.read().await;
         Ok((sm.last_applied_log, sm.last_membership.clone()))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn delete_conflict_logs_since(&mut self, log_id: LogId<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+    pub async fn delete_conflict_logs_since(
+        self: &mut Arc<Self>,
+        log_id: LogId<MemNodeId>,
+    ) -> Result<(), StorageError<MemNodeId>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
 
         {
@@ -419,7 +433,10 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn purge_logs_upto(&mut self, log_id: LogId<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+    pub async fn purge_logs_upto(
+        self: &mut Arc<Self>,
+        log_id: LogId<MemNodeId>,
+    ) -> Result<(), StorageError<MemNodeId>> {
         tracing::debug!("purge_log_upto: {:?}", log_id);
 
         if let Some(d) = self.get_blocking(&BlockOperation::PurgeLog) {
@@ -446,7 +463,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries))]
-    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<MemNodeId>>
+    pub async fn append_to_log<I>(self: &mut Arc<Self>, entries: I) -> Result<(), StorageError<MemNodeId>>
     where I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend {
         let mut log = self.log.write().await;
         for entry in entries {
@@ -458,8 +475,8 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries))]
-    async fn apply_to_state_machine(
-        &mut self,
+    pub async fn apply_to_state_machine(
+        self: &mut Arc<Self>,
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<ClientResponse>, StorageError<MemNodeId>> {
         let mut res = Vec::with_capacity(entries.len());
@@ -494,8 +511,8 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn begin_receiving_snapshot(
-        &mut self,
+    pub async fn begin_receiving_snapshot(
+        self: &mut Arc<Self>,
     ) -> Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<MemNodeId>> {
         if self.panic_on_begin_receiving_snapshot.load(Ordering::Relaxed) {
             panic!("injected state machine worker panic in begin_receiving_snapshot");
@@ -505,8 +522,8 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self, snapshot))]
-    async fn install_snapshot(
-        &mut self,
+    pub async fn install_snapshot(
+        self: &mut Arc<Self>,
         meta: &SnapshotMeta<MemNodeId, ()>,
         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<MemNodeId>> {
@@ -542,7 +559,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<MemNodeId>> {
+    pub async fn get_current_snapshot(
+        self: &mut Arc<Self>,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<MemNodeId>> {
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let data = snapshot.data.clone();
@@ -555,14 +574,178 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         }
     }
 
-    type LogReader = Self;
-    type SnapshotBuilder = Self;
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
+    pub async fn get_log_reader(self: &mut Arc<Self>) -> Arc<MemStore> {
         self.clone()
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+    pub async fn get_snapshot_builder(self: &mut Arc<Self>) -> Arc<MemStore> {
         self.clone()
+    }
+}
+
+#[cfg(not(feature = "storage-v2"))]
+impl RaftStorage<TypeConfig> for Arc<MemStore> {
+    type LogReader = Self;
+    type SnapshotBuilder = Self;
+
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<MemNodeId>> {
+        MemStore::get_log_state(self).await
+    }
+
+    async fn save_vote(&mut self, vote: &Vote<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::save_vote(self, vote).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<MemNodeId>>, StorageError<MemNodeId>> {
+        MemStore::read_vote(self).await
+    }
+
+    async fn save_committed(&mut self, committed: Option<LogId<MemNodeId>>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::save_committed(self, committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<MemNodeId>>, StorageError<MemNodeId>> {
+        MemStore::read_committed(self).await
+    }
+
+    async fn last_applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<MemNodeId>>, StoredMembership<MemNodeId, ()>), StorageError<MemNodeId>> {
+        MemStore::last_applied_state(self).await
+    }
+
+    async fn delete_conflict_logs_since(&mut self, log_id: LogId<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::delete_conflict_logs_since(self, log_id).await
+    }
+
+    async fn purge_logs_upto(&mut self, log_id: LogId<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::purge_logs_upto(self, log_id).await
+    }
+
+    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<MemNodeId>>
+    where I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend {
+        MemStore::append_to_log(self, entries).await
+    }
+
+    async fn apply_to_state_machine(
+        &mut self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<Vec<ClientResponse>, StorageError<MemNodeId>> {
+        MemStore::apply_to_state_machine(self, entries).await
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<MemNodeId>> {
+        MemStore::begin_receiving_snapshot(self).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<MemNodeId, ()>,
+        snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+    ) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::install_snapshot(self, meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<MemNodeId>> {
+        MemStore::get_current_snapshot(self).await
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        MemStore::get_log_reader(self).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        MemStore::get_snapshot_builder(self).await
+    }
+}
+
+#[cfg(feature = "storage-v2")]
+impl RaftLogStorage<TypeConfig> for Arc<MemStore> {
+    type LogReader = Self;
+
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<MemNodeId>> {
+        MemStore::get_log_state(self).await
+    }
+
+    async fn save_vote(&mut self, vote: &Vote<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::save_vote(self, vote).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<MemNodeId>>, StorageError<MemNodeId>> {
+        MemStore::read_vote(self).await
+    }
+
+    async fn save_committed(&mut self, committed: Option<LogId<MemNodeId>>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::save_committed(self, committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<MemNodeId>>, StorageError<MemNodeId>> {
+        MemStore::read_committed(self).await
+    }
+
+    async fn truncate(&mut self, log_id: LogId<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::delete_conflict_logs_since(self, log_id).await
+    }
+
+    async fn purge(&mut self, log_id: LogId<MemNodeId>) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::purge_logs_upto(self, log_id).await
+    }
+
+    async fn append<I>(&mut self, entries: I, callback: LogFlushed<TypeConfig>) -> Result<(), StorageError<MemNodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        MemStore::append_to_log(self, entries).await?;
+        callback.log_io_completed(Ok(()));
+        Ok(())
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        MemStore::get_log_reader(self).await
+    }
+}
+
+#[cfg(feature = "storage-v2")]
+impl RaftStateMachine<TypeConfig> for Arc<MemStore> {
+    type SnapshotBuilder = Self;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<MemNodeId>>, StoredMembership<MemNodeId, ()>), StorageError<MemNodeId>> {
+        MemStore::last_applied_state(self).await
+    }
+
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ClientResponse>, StorageError<MemNodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        MemStore::apply_to_state_machine(self, &entries).await
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<MemNodeId>> {
+        MemStore::begin_receiving_snapshot(self).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<MemNodeId, ()>,
+        snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+    ) -> Result<(), StorageError<MemNodeId>> {
+        MemStore::install_snapshot(self, meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<MemNodeId>> {
+        MemStore::get_current_snapshot(self).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        MemStore::get_snapshot_builder(self).await
     }
 }

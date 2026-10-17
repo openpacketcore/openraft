@@ -35,7 +35,12 @@ use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use openraft::storage::Adaptor;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::LogFlushed;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::RaftLogStorage;
+#[cfg(feature = "storage-v2")]
+use openraft::storage::RaftStateMachine;
 use openraft::AsyncRuntime;
 use openraft::CommittedLeaderId;
 use openraft::Config;
@@ -50,6 +55,7 @@ use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftLogReader;
 use openraft::RaftSnapshotBuilder;
+#[cfg(not(feature = "storage-v2"))]
 use openraft::RaftStorage;
 use openraft::RaftTypeConfig;
 use openraft::ServerState;
@@ -69,6 +75,7 @@ use tokio::sync::watch;
 use tokio::sync::Semaphore;
 
 use crate::fixtures::init_default_ut_tracing;
+use crate::fixtures::storage::Store;
 use crate::fixtures::RaftRouter;
 use crate::fixtures::RaftRouterNetwork;
 
@@ -545,10 +552,7 @@ impl<C: FixtureConfig> RaftSnapshotBuilder<C> for ObservedBuilder {
     }
 }
 
-impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
-    type LogReader = GenerationReader;
-    type SnapshotBuilder = ObservedBuilder;
-
+impl ObservedStore {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let gate = self.probe.armed_vote_failure.lock().unwrap().take();
         if let Some(gate) = gate {
@@ -575,7 +579,7 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
         self.inner.read_committed().await
     }
 
-    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<u64>> {
+    async fn get_log_state<C: FixtureConfig>(&mut self) -> Result<LogState<C>, StorageError<u64>> {
         let state = self.inner.get_log_state().await?;
         Ok(LogState {
             last_purged_log_id: state.last_purged_log_id,
@@ -583,7 +587,7 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
         })
     }
 
-    async fn get_log_reader(&mut self) -> Self::LogReader {
+    async fn get_log_reader(&mut self) -> GenerationReader {
         let generation = self.probe.next_generation.fetch_add(1, Ordering::SeqCst);
         let target = self.probe.next_target.lock().unwrap().take();
         let gate = target.and_then(|target| self.probe.armed.lock().unwrap().remove(&target));
@@ -644,7 +648,7 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
         self.inner.apply_to_state_machine(entries).await
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+    async fn get_snapshot_builder(&mut self) -> ObservedBuilder {
         ObservedBuilder(self.inner.get_snapshot_builder().await)
     }
 
@@ -661,7 +665,7 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
         self.inner.install_snapshot(meta, snapshot).await
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
+    async fn get_current_snapshot<C: FixtureConfig>(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
         let gate = self.probe.armed_snapshot_read.lock().unwrap().take();
         if let Some(gate) = gate {
             let snapshot = self.inner.get_current_snapshot().await?;
@@ -688,6 +692,167 @@ impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
             meta: snapshot.meta,
             snapshot: snapshot.snapshot,
         }))
+    }
+}
+
+#[cfg(not(feature = "storage-v2"))]
+impl<C: FixtureConfig> RaftStorage<C> for ObservedStore {
+    type LogReader = GenerationReader;
+    type SnapshotBuilder = ObservedBuilder;
+
+    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_vote(self, vote).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
+        ObservedStore::read_vote(self).await
+    }
+
+    async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_committed(self, committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+        ObservedStore::read_committed(self).await
+    }
+
+    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<u64>> {
+        ObservedStore::get_log_state::<C>(self).await
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        ObservedStore::get_log_reader(self).await
+    }
+
+    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
+    where I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend {
+        ObservedStore::append_to_log(self, entries).await
+    }
+
+    async fn delete_conflict_logs_since(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::delete_conflict_logs_since(self, log_id).await
+    }
+
+    async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::purge_logs_upto(self, log_id).await
+    }
+
+    async fn last_applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, ()>), StorageError<u64>> {
+        ObservedStore::last_applied_state(self).await
+    }
+
+    async fn apply_to_state_machine(
+        &mut self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<Vec<ClientResponse>, StorageError<u64>> {
+        ObservedStore::apply_to_state_machine(self, entries).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        ObservedStore::get_snapshot_builder(self).await
+    }
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+        ObservedStore::begin_receiving_snapshot(self).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, ()>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<u64>> {
+        ObservedStore::install_snapshot(self, meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
+        ObservedStore::get_current_snapshot::<C>(self).await
+    }
+}
+
+#[cfg(feature = "storage-v2")]
+impl<C: FixtureConfig> RaftLogStorage<C> for ObservedStore {
+    type LogReader = GenerationReader;
+
+    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_vote(self, vote).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
+        ObservedStore::read_vote(self).await
+    }
+
+    async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
+        ObservedStore::save_committed(self, committed).await
+    }
+
+    async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+        ObservedStore::read_committed(self).await
+    }
+
+    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<u64>> {
+        ObservedStore::get_log_state::<C>(self).await
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        ObservedStore::get_log_reader(self).await
+    }
+
+    async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        ObservedStore::append_to_log(self, entries).await?;
+        callback.log_io_completed(Ok(()));
+        Ok(())
+    }
+
+    async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::delete_conflict_logs_since(self, log_id).await
+    }
+
+    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        ObservedStore::purge_logs_upto(self, log_id).await
+    }
+}
+
+#[cfg(feature = "storage-v2")]
+impl<C: FixtureConfig> RaftStateMachine<C> for ObservedStore {
+    type SnapshotBuilder = ObservedBuilder;
+
+    async fn applied_state(&mut self) -> Result<(Option<LogId<u64>>, StoredMembership<u64, ()>), StorageError<u64>> {
+        ObservedStore::last_applied_state(self).await
+    }
+
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ClientResponse>, StorageError<u64>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        ObservedStore::apply_to_state_machine(self, &entries).await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        ObservedStore::get_snapshot_builder(self).await
+    }
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+        ObservedStore::begin_receiving_snapshot(self).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, ()>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<u64>> {
+        ObservedStore::install_snapshot(self, meta, snapshot).await
+    }
+
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
+        ObservedStore::get_current_snapshot::<C>(self).await
     }
 }
 
@@ -928,8 +1093,8 @@ impl Fixture {
         };
         // No adapter lock is held by a GenerationReader. Separate state/log adapters
         // also ensure storage instrumentation cannot serialize unrelated work.
-        let (log, _) = Adaptor::new(observed.clone());
-        let (_, state) = Adaptor::new(observed);
+        let (log, _) = Store::new(observed.clone());
+        let (_, state) = Store::new(observed);
         let network = ObservedNetwork {
             router: router.clone(),
             probe: probe.clone(),
@@ -1919,8 +2084,8 @@ async fn snapshot_callback_does_not_release_child_ownership_before_join_completi
         inner: store.clone(),
         probe: probe.clone(),
     };
-    let (log, _) = Adaptor::new(observed_store.clone());
-    let (_, state) = Adaptor::new(observed_store);
+    let (log, _) = Store::new(observed_store.clone());
+    let (_, state) = Store::new(observed_store);
     let raft = Raft::<CallbackConfig>::new(
         0,
         config,
