@@ -1832,6 +1832,113 @@ async fn retired_snapshot(fixture: &Fixture) -> Result<Arc<SnapshotGate>> {
     Ok(gate)
 }
 
+/// A durable snapshot recovered by a former leader schedules a purge at startup.
+/// Demotion must retry that target after its original replication reader drains.
+#[async_entry::test(worker_threads = 4, init = "init_default_ut_tracing()", tracing_span = "debug")]
+async fn restored_leader_stepdown_purges_recovered_snapshot_after_reader_drains() -> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let result = async {
+        fixture.add(1).await?;
+        for serial in 1..=10 {
+            fixture.write(serial).await?;
+        }
+        let last = fixture.store.get_state_machine().await.last_applied_log.unwrap();
+        fixture.caught_up(&[1], last).await?;
+        let persisted_vote = fixture.store.clone().read_vote().await?.unwrap();
+        within(
+            fixture.raft.shutdown(),
+            "stop original leader before snapshot publication",
+        )
+        .await??;
+
+        // Publish through the real store after the old core has stopped, so no
+        // snapshot-completion callback can update that core's purge frontier.
+        let snapshot = fixture.store.clone().get_snapshot_builder().await.build_snapshot().await?;
+        anyhow::ensure!(snapshot.meta.last_log_id == Some(last));
+        let initial_purge = fixture.store.clone().get_log_state().await?.last_purged_log_id;
+        let mut config = fixture.raft.config().as_ref().clone();
+        config.max_in_snapshot_log_to_keep = 2;
+        config.max_payload_entries = 2;
+        let before = fixture.store.clone().try_get_log_entries(0..).await?;
+        let target = before[before.len() - 3].log_id;
+        let suffix = before[before.len() - 2..].to_vec();
+        anyhow::ensure!(Some(target) > initial_purge);
+        let initial_operations = fixture.probe.operations().len();
+        let reader = fixture.probe.arm_reader(1);
+        let observed_store = ObservedStore {
+            inner: fixture.store.clone(),
+            probe: fixture.probe.clone(),
+        };
+        let (log, _) = Store::new(observed_store.clone());
+        let (_, state) = Store::new(observed_store);
+        fixture.raft = Raft::new(
+            0,
+            Arc::new(config.validate()?),
+            ObservedNetwork {
+                router: fixture.router.clone(),
+                probe: fixture.probe.clone(),
+            },
+            log,
+            state,
+        )
+        .await?;
+        let range = reader.entered().await?;
+        anyhow::ensure!(range.start <= target.index && range.start < range.end);
+        let (role, recovered_snapshot, committed) = within(
+            fixture
+                .raft
+                .with_raft_state(|state| (state.server_state, state.snapshot_meta.last_log_id, state.committed)),
+            "RESTORED_PURGE_SETUP: inspect recovered leader state",
+        )
+        .await??;
+        anyhow::ensure!(role == ServerState::Leader && recovered_snapshot == Some(last) && committed == Some(last));
+        anyhow::ensure!(fixture.store.clone().read_vote().await? == Some(persisted_vote));
+        anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_purged_log_id == initial_purge);
+        anyhow::ensure!(fixture.probe.operations().len() == initial_operations);
+
+        let vote = Vote::new_committed(fixture.raft.metrics().borrow().current_term + 1, 1);
+        let mut demote = std::pin::pin!(fixture.raft.append_entries(AppendEntriesRequest {
+            vote,
+            prev_log_id: Some(last),
+            entries: vec![],
+            leader_commit: Some(last),
+        }));
+        anyhow::ensure!(futures::poll!(&mut demote).is_pending());
+        anyhow::ensure!(tokio::time::timeout(HELD, &mut demote).await.is_err());
+        anyhow::ensure!(fixture.store.clone().read_vote().await? == Some(vote));
+        anyhow::ensure!(!*reader.dropped.borrow());
+        anyhow::ensure!(fixture.probe.operations().len() == initial_operations);
+        anyhow::ensure!(fixture.store.clone().get_log_state().await?.last_purged_log_id == initial_purge);
+
+        reader.release();
+        anyhow::ensure!(within(&mut demote, "RESTORED_PURGE_JOIN: reader did not drain").await??.is_success());
+        observed(&reader.dropped, "RESTORED_PURGE_JOIN: reader remains owned").await?;
+        // No new write, snapshot, or explicit purge supplies another retry.
+        within(
+            fixture.raft.wait(None).purged(Some(target), "restored leader purged after demotion"),
+            "RESTORED_PURGE_IDLE: stepdown left the recovered prefix pending",
+        )
+        .await??;
+        let logs = fixture.store.clone().get_log_state().await?;
+        anyhow::ensure!(logs.last_purged_log_id == Some(target) && logs.last_log_id == Some(last));
+        let retained = fixture.store.clone().try_get_log_entries(0..).await?;
+        anyhow::ensure!(serde_json::to_value(&retained)? == serde_json::to_value(&suffix)?);
+        let metrics = fixture.raft.metrics().borrow().clone();
+        anyhow::ensure!(metrics.state == ServerState::Follower && metrics.snapshot == Some(last));
+        let operations = fixture.probe.operations();
+        anyhow::ensure!(
+            operations.len() == initial_operations + 1
+                && operations.last().unwrap().operation == "purge"
+                && operations.last().unwrap().log_id == Some(target)
+        );
+        fixture.probe.assert_no_overlap()
+    }
+    .await;
+    let cleanup = fixture.stop().await;
+    result?;
+    cleanup
+}
+
 async fn stepdown_pending_purge(fail_reader: bool) -> Result<()> {
     let fixture = Fixture::new().await?;
     let result = async {

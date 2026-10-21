@@ -181,17 +181,20 @@ where C: RaftTypeConfig
             rh.update_local_progress(rh.state.last_log_id().cloned());
 
             rh.initiate_replication(SendNone::False);
-
-            return;
+        } else {
+            self.state.server_state = if self.state.membership_state.effective().is_voter(&self.config.id) {
+                ServerState::Follower
+            } else {
+                ServerState::Learner
+            };
         }
 
-        let server_state = if self.state.membership_state.effective().is_voter(&self.config.id) {
-            ServerState::Follower
-        } else {
-            ServerState::Learner
-        };
-
-        self.state.server_state = server_state;
+        // A snapshot may have become durable before the previous engine received
+        // its build completion. Restore initial replication probes against the
+        // retained range, then recover the policy target without another snapshot.
+        // The normal purge guard protects those in-flight reads.
+        self.log_handler().schedule_policy_based_purge();
+        self.try_purge_log();
 
         tracing::info!(
             "startup done: id={} target_state: {:?}",

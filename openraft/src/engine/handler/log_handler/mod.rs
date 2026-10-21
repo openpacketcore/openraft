@@ -51,8 +51,8 @@ where C: RaftTypeConfig
     /// Update the next log id to purge upto, if more logs can be purged, according to configured
     /// policy.
     ///
-    /// This method is called after building a snapshot, because openraft only purge logs that are
-    /// already included in snapshot.
+    /// Called after building a snapshot and at startup after recovering a durable snapshot.
+    /// Only logs already included in that snapshot are eligible for policy purging.
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn schedule_policy_based_purge(&mut self) {
         if let Some(purge_upto) = self.calc_purge_upto() {
@@ -89,7 +89,7 @@ where C: RaftTypeConfig
             purge_end
         );
 
-        if st.last_purged_log_id().next_index() + batch_size > purge_end {
+        if purge_end == 0 || st.last_purged_log_id().next_index() + batch_size > purge_end {
             tracing::debug!(
                 snapshot_last_log_id = debug(self.state.snapshot_meta.last_log_id.clone()),
                 max_keep,
